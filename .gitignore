@@ -1,0 +1,33 @@
+# Local-only: never in git
+# ownCloud app password, X16Link PSKs
+secrets/
+# test logs, emulator SD dirs, key files, screenshots
+run/
+# compiler output
+build/
+# JDK, prog8c jar, 64tass, SDL2, x16emu bundle, ROM (see TOOLCHAIN.md)
+tools/
+# emulator / libximodem / SDL2 / 64tass source clones (pinned in TOOLCHAIN.md)
+src/
+# separate repos: commanderx16wp, commanderx16calendar
+apps/
+hub/data/
+hub/.venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-journal
+*.db-wal
+*.pem
+*.key
+*.KEY
+*.keys
+*.rom
+rom.bin
+*.prg
+*.png
+*.gif
+# local copies with real hosts/addresses (see hub/README.local.md)
+*.local.md

@@ -1,0 +1,346 @@
+"""Docs channel (1): LIST / OPEN / READ / SAVE / WRITE / COMMIT on ownCloud Documents/."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import struct
+import time
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
+
+from . import frame as F
+from .frame import Reader, pstr
+from .rtfconv import WP_CHARSET, decode_utf8, rtf_to_text, text_to_rtf, to_wire_text
+
+log = logging.getLogger("x16hub.link.docs")
+
+DOCS_ROOT = "Documents"
+MAX_FILE = 1 << 20             # 1 MiB, either direction
+MAX_NAME = 63                  # bytes on the wire (ISO-8859-15)
+MAX_LIST = 1000
+MAX_DEPTH = 8
+MAX_FOLDERS = 200
+PENDING_TTL = 15 * 60
+MAX_PENDING_PER_DEV = 2
+TZ = ZoneInfo("America/New_York")
+_BAD_CHARS = set('\\:*?"<>|')
+
+T_OTHER, T_RTF, T_TXT = 0, 1, 2
+FL_UNSUPPORTED, FL_LOSSY, FL_TOO_LARGE = 1, 2, 4
+
+
+class DocError(Exception):
+    def __init__(self, code: int, msg: str, extra: bytes = b""):
+        super().__init__(msg)
+        self.code, self.extra = code, extra
+
+
+def file_type(name: str) -> int:
+    low = name.lower()
+    if low.endswith(".rtf"):
+        return T_RTF
+    if low.endswith(".txt"):
+        return T_TXT
+    return T_OTHER
+
+
+def check_name(name: str, *, for_save: bool = False) -> str:
+    """Validate a Documents-relative path. Returns the normalised name or raises DocError."""
+    if not name or len(name.encode(WP_CHARSET, "replace")) > MAX_NAME:
+        raise DocError(F.E_BAD_NAME, "name empty or too long")
+    segs = name.split("/")
+    for s in segs:
+        if s in ("", ".", ".."):
+            raise DocError(F.E_BAD_NAME, "bad path segment")
+        if s[0] in ". " or s[-1] == " ":
+            raise DocError(F.E_BAD_NAME, "name may not start with '.' or space")
+        for ch in s:
+            o = ord(ch)
+            if o < 0x20 or 0x7F <= o <= 0x9F or ch in _BAD_CHARS:
+                raise DocError(F.E_BAD_NAME, "name has a forbidden character")
+    if for_save and file_type(name) == T_OTHER:
+        raise DocError(F.E_BAD_NAME, "name must end in .rtf or .txt")
+    return "/".join(segs)
+
+
+def wire_name(b: bytes, *, for_save: bool = False) -> str:
+    return check_name(b.decode(WP_CHARSET), for_save=for_save)  # every byte decodes; C1 rejected in check
+
+
+def _unix(last_modified: str | None) -> int:
+    try:
+        return int(parsedate_to_datetime(last_modified).timestamp()) if last_modified else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _local5(ts: int) -> bytes:
+    if ts <= 0:
+        return bytes(5)
+    from datetime import datetime, timezone
+    d = datetime.fromtimestamp(ts, timezone.utc).astimezone(TZ)
+    return bytes([max(0, min(255, d.year - 2000)), d.month, d.day, d.hour, d.minute])
+
+
+@dataclass
+class Entry:
+    name: str
+    size: int
+    mtime: int
+    etag: str | None
+
+    def encode(self) -> bytes:
+        t = file_type(self.name)
+        wn, lossy = to_wire_text(self.name)
+        flags = 0
+        if lossy:
+            flags |= FL_LOSSY
+        if self.size > MAX_FILE:
+            flags |= FL_TOO_LARGE
+        try:
+            check_name(self.name)
+            bad = False
+        except DocError:
+            bad = True
+        if t == T_OTHER or bad or lossy or len(wn) > MAX_NAME or self.size > MAX_FILE:
+            flags |= FL_UNSUPPORTED
+        return (bytes([t, flags]) + struct.pack("<II", min(self.size, 0xFFFFFFFF), self.mtime & 0xFFFFFFFF)
+                + _local5(self.mtime) + pstr(wn[:255]))
+
+
+@dataclass
+class Upload:
+    size: int
+    crc: int
+    buf: bytearray = field(default_factory=bytearray)
+    created: float = field(default_factory=time.monotonic)
+
+
+class PendingUploads:
+    """Server-wide (shared by sessions) so a dropped connection can resume."""
+
+    def __init__(self):
+        self.by_dev: dict[str, dict[tuple[int, int], Upload]] = {}
+
+    def get(self, dev: str, size: int, crc: int) -> Upload:
+        now = time.monotonic()
+        ups = self.by_dev.setdefault(dev, {})
+        for k in [k for k, u in ups.items() if now - u.created > PENDING_TTL]:
+            del ups[k]
+        u = ups.get((size, crc))
+        if u is None:
+            while len(ups) >= MAX_PENDING_PER_DEV:
+                del ups[min(ups, key=lambda k: ups[k].created)]
+            u = ups[(size, crc)] = Upload(size, crc)
+        return u
+
+    def drop(self, dev: str, size: int, crc: int) -> None:
+        self.by_dev.get(dev, {}).pop((size, crc), None)
+
+
+class DocsChannel:
+    """Per-session docs state. `oc` is an OwnCloud-like client (blocking; run in a thread)."""
+
+    def __init__(self, oc, device: str, pending: PendingUploads, peer_maxrx: int):
+        self.oc, self.device, self.pending, self.maxrx = oc, device, pending, peer_maxrx
+        self.snapshot: list[Entry] = []
+        self.open_data: bytes | None = None
+        self.save: dict | None = None
+
+    async def _call(self, fn, *a, **kw):
+        from ..backend.owncloud import NotFound, OCError, PreconditionFailed, TooLarge
+        try:
+            return await asyncio.to_thread(fn, *a, **kw)
+        except PreconditionFailed:
+            raise
+        except TooLarge:
+            raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB") from None
+        except NotFound:
+            raise DocError(F.E_NOT_FOUND, "file not found") from None
+        except OCError as e:
+            log.warning("ownCloud error: %s", e)
+            if e.status == 409:
+                raise DocError(F.E_BAD_NAME, "folder does not exist") from None
+            raise DocError(F.E_BACKEND, f"ownCloud error{f' (HTTP {e.status})' if e.status else ''}") from None
+
+    async def handle(self, op: int, payload: bytes) -> bytes:
+        r = Reader(payload)
+        if op == F.OP_LIST:
+            return await self.list(r)
+        if op == F.OP_OPEN:
+            return await self.open(r)
+        if op == F.OP_READ:
+            return self.read(r)
+        if op == F.OP_SAVE:
+            return self.save_begin(r)
+        if op == F.OP_WRITE:
+            return self.write(r)
+        if op == F.OP_COMMIT:
+            r.end()
+            return await self.commit()
+        raise DocError(F.E_BAD_OP, "unknown docs op")
+
+    # ---- LIST
+    def _walk(self) -> list[Entry]:
+        self.oc.ensure_folder(DOCS_ROOT)
+        out: list[Entry] = []
+        todo = [(DOCS_ROOT, 0)]
+        folders = 0
+        prefix = DOCS_ROOT + "/"
+        while todo and len(out) < MAX_LIST:
+            path, depth = todo.pop()
+            folders += 1
+            if folders > MAX_FOLDERS:
+                break
+            for it in self.oc.list(path):
+                p = it["path"].rstrip("/")
+                if p == path or not p.startswith(prefix):
+                    continue
+                if it["is_dir"]:
+                    if depth + 1 < MAX_DEPTH:
+                        todo.append((p, depth + 1))
+                    continue
+                out.append(Entry(p[len(prefix):], it["size"], _unix(it["last_modified"]), it["etag"]))
+                if len(out) >= MAX_LIST:
+                    break
+        out.sort(key=lambda e: e.name.casefold())
+        return out
+
+    async def list(self, r: Reader) -> bytes:
+        start, mx = r.u16(), r.u8()
+        r.end()
+        if start == 0:
+            self.snapshot = await self._call(self._walk)
+        total = len(self.snapshot)
+        if start > total:
+            raise DocError(F.E_BAD_ARG, "start beyond end of list")
+        body = b""
+        n = 0
+        room = self.maxrx - 5
+        for e in self.snapshot[start:start + max(0, mx)]:
+            enc = e.encode()
+            if len(body) + len(enc) > room:
+                break
+            body += enc
+            n += 1
+        return struct.pack("<HHB", total, start, n) + body
+
+    # ---- OPEN / READ
+    async def open(self, r: Reader) -> bytes:
+        conv = r.u8()
+        name = wire_name(r.str_())
+        r.end()
+        if conv not in (0, 1):
+            raise DocError(F.E_BAD_ARG, "bad conv")
+        t = file_type(name)
+        if t == T_OTHER:
+            raise DocError(F.E_UNSUPPORTED, "file type not supported")
+        path = f"{DOCS_ROOT}/{name}"
+        st = await self._call(self.oc.stat, path)
+        if st is None or st["is_dir"]:
+            raise DocError(F.E_NOT_FOUND, "file not found")
+        if st["size"] > MAX_FILE:
+            raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
+        data, etag = await self._call(self.oc.get, path, max_bytes=MAX_FILE)
+        if len(data) > MAX_FILE:
+            raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
+        lossy = False
+        if t == T_TXT:
+            text = decode_utf8(data)
+            if conv == 1:
+                data, lossy = text_to_rtf(text)
+            else:
+                data, lossy = to_wire_text(text)
+        if len(data) > MAX_FILE:
+            raise DocError(F.E_TOO_LARGE, "converted file is larger than 1 MiB")
+        self.open_data = data
+        etag = etag or st["etag"] or ""
+        return (bytes([t, FL_LOSSY if lossy else 0]) + struct.pack("<III", len(data), F.crc32(data),
+                _unix(st["last_modified"])) + pstr(etag.encode("ascii", "replace")))
+
+    def read(self, r: Reader) -> bytes:
+        off, ln = r.u32(), r.u16()
+        r.end()
+        if self.open_data is None:
+            raise DocError(F.E_BAD_STATE, "nothing is open")
+        if off > len(self.open_data):
+            raise DocError(F.E_BAD_ARG, "offset beyond end of file")
+        ln = min(ln, self.maxrx - 4)
+        return struct.pack("<I", off) + self.open_data[off:off + ln]
+
+    # ---- SAVE / WRITE / COMMIT
+    def save_begin(self, r: Reader) -> bytes:
+        mode, conv, size, crc = r.u8(), r.u8(), r.u32(), r.u32()
+        name = wire_name(r.str_(), for_save=True)
+        raw_etag = r.str_()
+        r.end()
+        # the etag ends up in an If-Match header: allow only what ownCloud etags look like
+        if not re.fullmatch(rb'(W/)?"?[0-9A-Za-z:._-]{0,64}"?', raw_etag):
+            raise DocError(F.E_BAD_ARG, "bad etag")
+        etag = raw_etag.decode("ascii")
+        if mode not in (0, 1) or conv not in (0, 1):
+            raise DocError(F.E_BAD_ARG, "bad mode/conv")
+        if mode == 1 and not etag:
+            raise DocError(F.E_BAD_ARG, "overwrite needs the etag being replaced")
+        if size > MAX_FILE:
+            raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
+        up = self.pending.get(self.device, size, crc)
+        self.save = {"mode": mode, "conv": conv, "name": name, "etag": etag, "size": size, "crc": crc, "up": up}
+        return struct.pack("<I", len(up.buf))
+
+    def write(self, r: Reader) -> bytes:
+        off = r.u32()
+        data = r.rest()
+        if self.save is None:
+            raise DocError(F.E_BAD_STATE, "no SAVE in progress")
+        up: Upload = self.save["up"]
+        if off != len(up.buf):
+            raise DocError(F.E_BAD_ARG, "offset does not match", struct.pack("<I", len(up.buf)))
+        if len(up.buf) + len(data) > up.size:
+            raise DocError(F.E_BAD_ARG, "more data than announced", struct.pack("<I", len(up.buf)))
+        up.buf += data
+        return struct.pack("<I", len(up.buf))
+
+    async def commit(self) -> bytes:
+        from ..backend.owncloud import PreconditionFailed
+        s = self.save
+        if s is None:
+            raise DocError(F.E_BAD_STATE, "no SAVE in progress")
+        up: Upload = s["up"]
+        data = bytes(up.buf)
+        if len(data) != s["size"] or F.crc32(data) != s["crc"]:
+            self.pending.drop(self.device, s["size"], s["crc"])
+            self.save = None
+            raise DocError(F.E_BAD_CHECKSUM, "upload size/CRC32 mismatch; send it again")
+        t = file_type(s["name"])
+        if t == T_TXT:
+            try:
+                text = rtf_to_text(data, WP_CHARSET) if s["conv"] == 1 else data.decode(WP_CHARSET)
+            except (ValueError, RecursionError):
+                self.pending.drop(self.device, s["size"], s["crc"])     # retrying can't help
+                self.save = None
+                raise DocError(F.E_BAD_ARG, "RTF could not be converted to text") from None
+            data = text.encode("utf-8")
+        path = f"{DOCS_ROOT}/{s['name']}"
+        await self._call(self.oc.ensure_folder, DOCS_ROOT)
+        try:
+            if s["mode"] == 0:
+                etag = await self._call(self.oc.put, path, data, create_only=True)
+            else:
+                etag = await self._call(self.oc.put, path, data, if_match=s["etag"])
+        except PreconditionFailed:
+            st = await self._call(self.oc.stat, path)
+            if st is None:
+                raise DocError(F.E_NOT_FOUND, "file was deleted on ownCloud") from None
+            kind = F.CONFLICT_EXISTS if s["mode"] == 0 else F.CONFLICT_CHANGED
+            msg = "file already exists" if kind == F.CONFLICT_EXISTS else "file changed on ownCloud"
+            raise DocError(F.E_CONFLICT, msg, bytes([kind]) + pstr((st["etag"] or "").encode("ascii", "replace"))) from None
+        self.pending.drop(self.device, s["size"], s["crc"])
+        self.save = None
+        st = await self._call(self.oc.stat, path)
+        etag = etag or (st or {}).get("etag") or ""
+        mtime = _unix((st or {}).get("last_modified"))
+        log.info("device %s saved %s (%d bytes)", self.device, path, len(data))
+        return pstr(etag.encode("ascii", "replace")) + struct.pack("<II", mtime, len(data))

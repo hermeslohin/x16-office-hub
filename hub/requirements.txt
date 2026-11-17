@@ -1,0 +1,7 @@
+# x16hub runtime deps (ownCloud backend). Google packages were removed when the
+# Google backend was shelved (see x16hub/_shelved_google/__init__.py).
+requests==2.34.2
+defusedxml==0.7.1
+icalendar==7.3.0
+tzdata==2026.6
+python-dateutil==4.0.0
