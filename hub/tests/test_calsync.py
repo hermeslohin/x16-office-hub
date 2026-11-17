@@ -15,7 +15,7 @@ from x16hub.store import HubError
 NY = ZoneInfo("America/New_York")
 TODAY = date(2026, 11, 17)
 PET = C.Petscii()
-REPO_DAT = Path(__file__).resolve().parents[2] / "apps" / "calendar" / "CALENDAR.DAT"
+REPO_DAT = Path(__file__).resolve().parent / "fixtures" / "sample_calendar.dat"   # copy of the calendar repo's one-event sample
 
 
 class X16:
