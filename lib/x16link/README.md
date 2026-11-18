@@ -49,7 +49,7 @@ or in another bank, not in the transport.
 | `hangup()` / `forget()` | BYE + modem hangup / wipe the key from RAM (call it when you're done) |
 | `link_error(dst, max)` | Last error text (ISO-8859-1) |
 | `list_begin/list_total/list_row/list_name` | Docs picker (X16DOCS.BIN) |
-| `download(remote, local, conv)` / `upload(local, remote, mode, conv)` | Docs transfer. `conv 1` = RTF on the X16 side |
+| `download(remote, local, conv)` / `upload(local, remote, mode, conv)` | Docs transfer. `conv 1` = RTF on the X16 side (.rtf .txt .docx), `conv 2` = simple XLSX (.xlsx .csv, see X16 Sheets SHEETFMT.md) |
 | `get_etag/set_etag/conflict` | Overwrite-if-unchanged and the conflict kind/etag after status 8 |
 
 Local statuses: 32 no/bad key file, 33 no serial card, 34 no modem, 35 can't reach the hub,

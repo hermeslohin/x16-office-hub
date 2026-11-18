@@ -260,7 +260,8 @@ _chunk      lda  #<508
         }
     }
 
-    ; dst[0]=type dst[1]=flags, dst+2: 68-char ISO row + 0 = name(38) size(8) date(16) type(3)
+    ; dst[0]=type (1 RTF 2 TXT 3 DOCX 4 XLSX 5 CSV) dst[1]=flags, dst+2: 68-char ISO row + 0 = name(38) size(8) date(16) type(3)
+    str tnames = iso:"---RTFTXTDOCXLSCSV"
     sub list_row(uword i, uword dst) -> ubyte {
         uword e = entry(i)
         if e == 0
@@ -296,12 +297,10 @@ _chunk      lda  #<508
             @(r + 61) = $3a
             put2(r + 62, @(e + 14))
         }
-        uword tname = iso:"RTF"
-        if @(e + 1) & 1 != 0
-            tname = iso:"---"
-        else if @(e) == 2
-            tname = iso:"TXT"
-        sys.memcopy(tname, r + 65, 3)
+        ubyte ty = @(e)
+        if @(e + 1) & 1 != 0 or ty > 5
+            ty = 0
+        sys.memcopy(&tnames + ty * 3, r + 65, 3)
         return S_OK
     }
 

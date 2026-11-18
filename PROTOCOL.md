@@ -205,12 +205,44 @@ missing). A **name** is the path relative to `Documents/`, `/`-separated
 **Name rules (hub, enforced on every op):** decoded per segment; no empty,
 `.` or `..` segments; no control characters, no `\ : * ? " < > |`; no
 leading dot or leading/trailing spaces; ≤ 63 bytes total. `SAVE` names must end
-in `.rtf` or `.txt` (case-insensitive). Anything else is `ERR BAD_NAME`.
+in `.rtf`, `.txt`, `.docx`, `.xlsx` or `.csv` (case-insensitive). Anything else
+is `ERR BAD_NAME`.
 
 **Types:** `1` = RTF (`.rtf`, the WP's native format, passed through
 byte-for-byte), `2` = text (`.txt`: UTF-8 on ownCloud, ISO-8859-15 on the wire;
-characters with no ISO-8859-15 form become `?`), `0` = other (listed,
-but `OPEN` refuses it).
+characters with no ISO-8859-15 form become `?`), `3` = Word (`.docx`),
+`4` = Excel (`.xlsx`), `5` = CSV (`.csv`, UTF-8 on ownCloud), `0` = other
+(listed, but `OPEN` refuses it).
+
+**conv** (OPEN and SAVE) says what the X16 side holds:
+
+| conv | X16 side | valid for |
+|---|---|---|
+| 0 | native bytes (`.txt`/`.csv`: ISO-8859-15 ↔ UTF-8, everything else byte-for-byte) | all types |
+| 1 | RTF for the X16 WP | `.rtf` `.txt` `.docx` |
+| 2 | X16 sheet = "simple XLSX" (commanderx16sheets `SHEETFMT.md`) | `.xlsx` `.csv` |
+
+conv > 2 is `ERR BAD_ARG`; a conv that doesn't fit the file type is
+`ERR UNSUPPORTED` (checked at `OPEN` / `SAVE`, before any data moves).
+Conversions (hub module in brackets):
+
+* `.docx` conv 1 [`docxconv`]: OPEN → RTF in the WP dialect (WP fonttbl, the WP's
+  16-colour colortbl, `\b \i \ul \fN \cfN \highlightN`, `\qc/\qr`, `\li` = level × 576,
+  `\pagebb` for page breaks, list markers as text, table rows as one paragraph
+  with cells 4 spaces apart, no `{\*\xwp}` tags so the WP re-wraps). SAVE: WP RTF →
+  DOCX (soft-wrapped lines rejoined, list markers → real Word lists, fonts,
+  text/highlight colours, alignment, indent, page breaks).
+* `.xlsx` conv 2 [`sheetconv`]: OPEN → simple XLSX (first sheet; shared strings,
+  styles mapped to the 32-entry table, booleans → 1/0, shared formulas expanded,
+  X16 limits applied: 256 columns, 9999 rows, 6000 cells, 50-byte texts (cut),
+  46-byte formulas (longer ones keep only their cached value)). SAVE: the upload must parse as an XLSX;
+  it is re-written deflated (formulas, cached values, styles, widths kept).
+* `.csv` conv 2: OPEN → simple XLSX (numbers, `12%`, `$1,234.50` recognised).
+  SAVE: cell values (formula cells: cached value) → UTF-8 CSV.
+
+Anything dropped or approximated sets the LOSSY flag on OPEN. A conversion that
+fails is `ERR UNSUPPORTED` on OPEN and `ERR BAD_ARG` on COMMIT (the pending
+upload is dropped). Converted data must still fit 1 MiB (`ERR TOO_LARGE`).
 
 #### LIST (`$10`)
 ```
@@ -230,12 +262,12 @@ the client's `maxrx` (≤ `max`).
 
 #### OPEN (`$11`)
 ```
-req : conv u8, name str        conv 0 = native bytes, 1 = deliver as RTF (txt → RTF wrapper)
+req : conv u8, name str        conv 0 = native, 1 = RTF, 2 = simple XLSX (see table above)
 rep : type u8, flags u8, size u32, crc32 u32, mtime u32, etag str
 ```
 The hub downloads the file once and keeps the converted bytes for this
 session. `crc32` (zlib/IEEE CRC-32) covers all `size` bytes as delivered.
-`flags` bit1 = lossy charset conversion.
+`flags` bit1 = lossy conversion (charset or format).
 
 #### READ (`$12`)
 ```
@@ -261,10 +293,12 @@ COMMIT req : (empty)
   changed since then, or `NOT_FOUND` if it was deleted meanwhile.
   There is deliberately no unconditional overwrite: overwriting always names
   the version being replaced, so a concurrent edit is never lost silently.
-* `conv 0`: bytes are stored as they are (`.txt`: ISO-8859-15 → UTF-8).
+* `conv 0`: bytes are stored as they are (`.txt`/`.csv`: ISO-8859-15 → UTF-8).
   `conv 1`: the content is RTF from the X16 WP. For a `.txt` target the hub
-  extracts the plain text (soft-wrapped lines rejoined) and stores it as UTF-8.
-  For `.rtf` it is stored unchanged.
+  extracts the plain text (soft-wrapped lines rejoined) and stores it as UTF-8;
+  for `.docx` it converts to DOCX; for `.rtf` it is stored unchanged.
+  `conv 2`: the content is an X16 sheet (simple XLSX), stored as a deflated
+  `.xlsx` or as UTF-8 `.csv`.
 * Uploads are buffered by the hub (≤ 1 MiB, ≤ 2 pending per device, 15 min).
   A pending upload is keyed by (device, size, crc32), so after a
   `CONFLICT` the client just sends `SAVE` again with the new mode/etag/name.

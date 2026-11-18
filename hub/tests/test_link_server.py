@@ -465,3 +465,125 @@ def test_etag_header_injection_refused():
             assert await c.noop(b"ok") == b"ok"
             await c.close()
     run(t())
+
+
+# ------------------------------------------------------------------ office formats (docx / xlsx / csv)
+
+def _office_files():
+    from test_officeconv import WP_SAMPLE, make_docx, r, real_xlsx, wp_rtf
+    return wp_rtf(WP_SAMPLE), make_docx("<w:p>" + r("Hello €") + "</w:p>"), real_xlsx()
+
+
+def test_list_office_types():
+    async def t():
+        async with Hub() as h:
+            _, docx, xlsx = _office_files()
+            h.oc.add("Documents/a.docx", docx)
+            h.oc.add("Documents/b.XLSX", xlsx)
+            h.oc.add("Documents/c.csv", b"1,2\n")
+            h.oc.add("Documents/d.doc", b"x")
+            c = await h.client()
+            _, items = await c.list()
+            by = {e.name: e for e in items}
+            assert [by[n].type for n in ("a.docx", "b.XLSX", "c.csv", "d.doc")] == [3, 4, 5, 0]
+            assert not any(by[n].flags & FL_UNSUPPORTED for n in ("a.docx", "b.XLSX", "c.csv"))
+            await c.close()
+    run(t())
+
+
+def test_open_office_conversions():
+    import io
+    import zipfile
+    from x16hub.link import sheetconv
+    async def t():
+        async with Hub() as h:
+            _, docx, xlsx = _office_files()
+            h.oc.add("Documents/a.docx", docx)
+            h.oc.add("Documents/b.xlsx", xlsx)
+            h.oc.add("Documents/c.csv", "x;ü\n1,5;2\n".encode())
+            h.oc.add("Documents/bad.xlsx", b"PK\x03\x04 this is not a zip")
+            c = await h.client()
+            info, data = await c.get("a.docx", conv=1)
+            assert info["type"] == 3 and not info["flags"] & FL_LOSSY
+            assert data.startswith(b"{\\rtf1") and b"Hello \\'a4\\par" in data
+            info, data = await c.get("a.docx", conv=0)
+            assert data == docx
+            info, data = await c.get("b.xlsx", conv=2)
+            assert info["type"] == 4 and info["flags"] & FL_LOSSY
+            z = zipfile.ZipFile(io.BytesIO(data))
+            assert all(i.compress_type == zipfile.ZIP_STORED for i in z.infolist())
+            sh, _ = sheetconv.read_sheet(data)
+            assert sh.cells[(1, 1)].v == "Header" and sh.cells[(4, 2)].f == "SUM($A$1:B3)+C$2*Other!B1"
+            info, data = await c.get("b.xlsx", conv=0)
+            assert data == xlsx
+            info, data = await c.get("c.csv", conv=2)
+            sh, _ = sheetconv.read_sheet(data)
+            assert info["type"] == 5 and sh.cells[(2, 1)].v == "1,5" and sh.cells[(1, 2)].v == "ü"
+            info, data = await c.get("c.csv", conv=0)
+            assert data == "x;ü\n1,5;2\n".encode("iso8859_15")
+            for name, conv in (("b.xlsx", 1), ("a.docx", 2), ("c.csv", 1)):
+                with pytest.raises(LinkError) as e:
+                    await c.open(name, conv)
+                assert e.value.code == F.E_UNSUPPORTED, (name, conv)
+            h.oc.add("Documents/x.rtf", b"{\\rtf1 x}")
+            for name in ("x.rtf", "missing.txt"):
+                with pytest.raises(LinkError) as e:
+                    await c.open(name, 2)
+                assert e.value.code == F.E_UNSUPPORTED
+            with pytest.raises(LinkError) as e:
+                await c.open("a.docx", 3)
+            assert e.value.code == F.E_BAD_ARG
+            with pytest.raises(LinkError) as e:
+                await c.open("bad.xlsx", 2)
+            assert e.value.code == F.E_UNSUPPORTED and "convert" in e.value.msg
+            assert await c.noop(b"ok") == b"ok"
+            await c.close()
+    run(t())
+
+
+def test_save_office_conversions():
+    import io
+    import zipfile
+    from x16hub.link import sheetconv
+    from test_officeconv import sample_sheet
+    async def t():
+        async with Hub() as h:
+            rtf, docx, _ = _office_files()
+            c = await h.client()
+            res = await c.save("Letter.docx", rtf, conv=1)
+            stored = h.oc.files["Documents/Letter.docx"][0]
+            assert res["size"] == len(stored)
+            z = zipfile.ZipFile(io.BytesIO(stored))
+            assert b"<w:numPr>" in z.read("word/document.xml") and b"pageBreakBefore" in z.read("word/document.xml")
+            await c.save("raw.docx", docx, conv=0)
+            assert h.oc.files["Documents/raw.docx"][0] == docx
+            simple = sheetconv.write_simple(sample_sheet())
+            await c.save("Budget.xlsx", simple, conv=2)
+            stored = h.oc.files["Documents/Budget.xlsx"][0]
+            z = zipfile.ZipFile(io.BytesIO(stored))
+            assert z.testzip() is None and all(i.compress_type == zipfile.ZIP_DEFLATED for i in z.infolist())
+            assert sheetconv.read_sheet(stored)[0] == sample_sheet()
+            await c.save("Budget.csv", simple, conv=2)
+            assert h.oc.files["Documents/Budget.csv"][0].decode().startswith("Item,12.5\r\n")
+            await c.save("t.csv", "a,€\n".encode("iso8859_15"), conv=0)
+            assert h.oc.files["Documents/t.csv"][0] == "a,€\n".encode()
+            # conv that doesn't fit the type: refused before any data is sent
+            for name, conv in (("x.rtf", 2), ("x.xlsx", 1), ("x.csv", 1), ("x.docx", 2)):
+                with pytest.raises(LinkError) as e:
+                    await c.save(name, b"data", conv=conv)
+                assert e.value.code == F.E_UNSUPPORTED, (name, conv)
+            with pytest.raises(LinkError) as e:
+                await c.save("x.xlsx", b"data", conv=3)
+            assert e.value.code == F.E_BAD_ARG
+            # bad content: E_BAD_ARG with a reason, upload dropped (a retry starts from 0)
+            for name, conv, bad in (("bad.xlsx", 2, b"PK not a zip"), ("bad.docx", 1, b"plain text"),
+                                    ("bad.csv", 2, b"{\\rtf1 nope}")):
+                with pytest.raises(LinkError) as e:
+                    await c.save(name, bad, conv=conv)
+                assert e.value.code == F.E_BAD_ARG and e.value.msg, name
+                p = await c.request(F.CH_DOCS, F.OP_SAVE, bytes([0, conv]) + struct.pack("<II", len(bad), F.crc32(bad))
+                                    + F.pstr(name) + F.pstr(""))
+                assert struct.unpack("<I", p)[0] == 0
+                assert f"Documents/{name}" not in h.oc.files
+            await c.close()
+    run(t())

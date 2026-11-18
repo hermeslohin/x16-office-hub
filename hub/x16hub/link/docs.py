@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 from . import frame as F
 from .frame import Reader, pstr
+from . import docxconv, sheetconv
+from .ooxml import ConvError
 from .rtfconv import WP_CHARSET, decode_utf8, rtf_to_text, text_to_rtf, to_wire_text
 
 log = logging.getLogger("x16hub.link.docs")
@@ -27,7 +29,10 @@ MAX_PENDING_PER_DEV = 2
 TZ = ZoneInfo("America/New_York")
 _BAD_CHARS = set('\\:*?"<>|')
 
-T_OTHER, T_RTF, T_TXT = 0, 1, 2
+T_OTHER, T_RTF, T_TXT, T_DOCX, T_XLSX, T_CSV = 0, 1, 2, 3, 4, 5
+_EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": T_CSV}
+# conv 0 = native bytes, 1 = RTF on the X16 side, 2 = X16 sheet (simple XLSX) on the X16 side
+CONV_OK = {T_RTF: (0, 1), T_TXT: (0, 1), T_DOCX: (0, 1), T_XLSX: (0, 2), T_CSV: (0, 2)}
 FL_UNSUPPORTED, FL_LOSSY, FL_TOO_LARGE = 1, 2, 4
 
 
@@ -39,11 +44,17 @@ class DocError(Exception):
 
 def file_type(name: str) -> int:
     low = name.lower()
-    if low.endswith(".rtf"):
-        return T_RTF
-    if low.endswith(".txt"):
-        return T_TXT
-    return T_OTHER
+    dot = low.rfind(".")
+    return _EXT.get(low[dot:], T_OTHER) if dot >= 0 else T_OTHER
+
+
+def check_conv(t: int, conv: int) -> None:
+    if conv not in (0, 1, 2):
+        raise DocError(F.E_BAD_ARG, "bad conv")
+    if t == T_OTHER:
+        raise DocError(F.E_UNSUPPORTED, "file type not supported")
+    if conv not in CONV_OK[t]:
+        raise DocError(F.E_UNSUPPORTED, "conversion not available for this file type")
 
 
 def check_name(name: str, *, for_save: bool = False) -> str:
@@ -61,7 +72,7 @@ def check_name(name: str, *, for_save: bool = False) -> str:
             if o < 0x20 or 0x7F <= o <= 0x9F or ch in _BAD_CHARS:
                 raise DocError(F.E_BAD_NAME, "name has a forbidden character")
     if for_save and file_type(name) == T_OTHER:
-        raise DocError(F.E_BAD_NAME, "name must end in .rtf or .txt")
+        raise DocError(F.E_BAD_NAME, "name must end in .rtf .txt .docx .xlsx or .csv")
     return "/".join(segs)
 
 
@@ -232,11 +243,8 @@ class DocsChannel:
         conv = r.u8()
         name = wire_name(r.str_())
         r.end()
-        if conv not in (0, 1):
-            raise DocError(F.E_BAD_ARG, "bad conv")
         t = file_type(name)
-        if t == T_OTHER:
-            raise DocError(F.E_UNSUPPORTED, "file type not supported")
+        check_conv(t, conv)
         path = f"{DOCS_ROOT}/{name}"
         st = await self._call(self.oc.stat, path)
         if st is None or st["is_dir"]:
@@ -247,12 +255,17 @@ class DocsChannel:
         if len(data) > MAX_FILE:
             raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
         lossy = False
-        if t == T_TXT:
-            text = decode_utf8(data)
-            if conv == 1:
-                data, lossy = text_to_rtf(text)
-            else:
-                data, lossy = to_wire_text(text)
+        if t in (T_TXT, T_CSV) and conv == 0:
+            data, lossy = to_wire_text(decode_utf8(data))
+        elif t == T_TXT:
+            data, lossy = text_to_rtf(decode_utf8(data))
+        elif conv and t in (T_DOCX, T_XLSX, T_CSV):
+            fn = {T_DOCX: docxconv.docx_to_rtf, T_XLSX: sheetconv.xlsx_to_simple, T_CSV: sheetconv.csv_to_simple}[t]
+            try:
+                data, lossy = await asyncio.to_thread(fn, data)
+            except (ConvError, RecursionError) as e:
+                msg = str(e) if isinstance(e, ConvError) else "file is nested too deeply"
+                raise DocError(F.E_UNSUPPORTED, f"cannot convert: {msg}"[:120]) from None
         if len(data) > MAX_FILE:
             raise DocError(F.E_TOO_LARGE, "converted file is larger than 1 MiB")
         self.open_data = data
@@ -280,8 +293,9 @@ class DocsChannel:
         if not re.fullmatch(rb'(W/)?"?[0-9A-Za-z:._-]{0,64}"?', raw_etag):
             raise DocError(F.E_BAD_ARG, "bad etag")
         etag = raw_etag.decode("ascii")
-        if mode not in (0, 1) or conv not in (0, 1):
+        if mode not in (0, 1) or conv not in (0, 1, 2):
             raise DocError(F.E_BAD_ARG, "bad mode/conv")
+        check_conv(file_type(name), conv)
         if mode == 1 and not etag:
             raise DocError(F.E_BAD_ARG, "overwrite needs the etag being replaced")
         if size > MAX_FILE:
@@ -314,15 +328,29 @@ class DocsChannel:
             self.pending.drop(self.device, s["size"], s["crc"])
             self.save = None
             raise DocError(F.E_BAD_CHECKSUM, "upload size/CRC32 mismatch; send it again")
-        t = file_type(s["name"])
-        if t == T_TXT:
-            try:
-                text = rtf_to_text(data, WP_CHARSET) if s["conv"] == 1 else data.decode(WP_CHARSET)
-            except (ValueError, RecursionError):
-                self.pending.drop(self.device, s["size"], s["crc"])     # retrying can't help
-                self.save = None
-                raise DocError(F.E_BAD_ARG, "RTF could not be converted to text") from None
-            data = text.encode("utf-8")
+        t, conv = file_type(s["name"]), s["conv"]
+        try:
+            if t in (T_TXT, T_CSV) and conv == 0:
+                data = data.decode(WP_CHARSET).encode("utf-8")
+            elif t == T_TXT:
+                data = rtf_to_text(data, WP_CHARSET).encode("utf-8")
+            elif t == T_DOCX and conv == 1:
+                data = await asyncio.to_thread(docxconv.wp_rtf_to_docx, data)
+            elif t == T_XLSX and conv == 2:
+                data = await asyncio.to_thread(sheetconv.simple_to_xlsx, data)
+            elif t == T_CSV:
+                data = await asyncio.to_thread(sheetconv.simple_to_csv, data)
+        except (ValueError, RecursionError) as e:          # ConvError is a ValueError
+            self.pending.drop(self.device, s["size"], s["crc"])     # retrying can't help
+            self.save = None
+            what = {T_TXT: "RTF could not be converted to text", T_DOCX: "RTF could not be converted to DOCX",
+                    T_XLSX: "not a valid X16 sheet", T_CSV: "sheet could not be converted to CSV"}.get(t, "bad data")
+            detail = f": {e}" if isinstance(e, ConvError) else ""
+            raise DocError(F.E_BAD_ARG, f"{what}{detail}"[:120]) from None
+        if len(data) > MAX_FILE:
+            self.pending.drop(self.device, s["size"], s["crc"])
+            self.save = None
+            raise DocError(F.E_TOO_LARGE, "converted file is larger than 1 MiB")
         path = f"{DOCS_ROOT}/{s['name']}"
         await self._call(self.oc.ensure_folder, DOCS_ROOT)
         try:
