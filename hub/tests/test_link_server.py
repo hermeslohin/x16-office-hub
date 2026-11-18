@@ -531,7 +531,7 @@ def test_open_office_conversions():
                     await c.open(name, 2)
                 assert e.value.code == F.E_UNSUPPORTED
             with pytest.raises(LinkError) as e:
-                await c.open("a.docx", 3)
+                await c.open("a.docx", 4)
             assert e.value.code == F.E_BAD_ARG
             with pytest.raises(LinkError) as e:
                 await c.open("bad.xlsx", 2)
@@ -573,7 +573,7 @@ def test_save_office_conversions():
                     await c.save(name, b"data", conv=conv)
                 assert e.value.code == F.E_UNSUPPORTED, (name, conv)
             with pytest.raises(LinkError) as e:
-                await c.save("x.xlsx", b"data", conv=3)
+                await c.save("x.xlsx", b"data", conv=4)
             assert e.value.code == F.E_BAD_ARG
             # bad content: E_BAD_ARG with a reason, upload dropped (a retry starts from 0)
             for name, conv, bad in (("bad.xlsx", 2, b"PK not a zip"), ("bad.docx", 1, b"plain text"),

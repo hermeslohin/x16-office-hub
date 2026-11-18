@@ -94,6 +94,11 @@ X16 app ─UART $9FE0 (115200 8N1, RTS/CTS)─ ESP32/Zimodem ─TCP─ x16hub :6
 | 1 | `$13` | SAVE | C→H | start (or resume) an upload |
 | 1 | `$14` | WRITE | C→H | upload a chunk |
 | 1 | `$15` | COMMIT | C→H | verify and store the upload in ownCloud |
+| 1 | `$16` | DIR | C→H | list one folder of `Documents/` (folders + files, paginated) |
+| 1 | `$17` | MKDIR | C→H | create a folder |
+| 1 | `$18` | DELETE | C→H | delete a file, or a folder with everything in it |
+| 1 | `$19` | MOVE | C→H | move/rename a file or folder inside `Documents/` |
+| 1 | `$1A` | COPY | C→H | copy a file or folder inside `Documents/` |
 | 2 | `$30`–`$4F` | (calendar) | | reserved for the calendar sync ops |
 
 Replies use `OP | $80` (e.g. `HELLO` → `$81`). Ops on any channel other than 0
@@ -205,14 +210,17 @@ missing). A **name** is the path relative to `Documents/`, `/`-separated
 **Name rules (hub, enforced on every op):** decoded per segment; no empty,
 `.` or `..` segments; no control characters, no `\ : * ? " < > |`; no
 leading dot or leading/trailing spaces; ≤ 63 bytes total. `SAVE` names must end
-in `.rtf`, `.txt`, `.docx`, `.xlsx` or `.csv` (case-insensitive). Anything else
+in `.rtf`, `.txt`, `.docx`, `.xlsx` or `.csv` (case-insensitive), except with `conv 3` (raw). Anything else
 is `ERR BAD_NAME`.
+
+**Folder paths** (DIR, MKDIR, DELETE, MOVE, COPY) follow the same rules; the empty
+path means `Documents/` itself and is only accepted by DIR.
 
 **Types:** `1` = RTF (`.rtf`, the WP's native format, passed through
 byte-for-byte), `2` = text (`.txt`: UTF-8 on ownCloud, ISO-8859-15 on the wire;
 characters with no ISO-8859-15 form become `?`), `3` = Word (`.docx`),
 `4` = Excel (`.xlsx`), `5` = CSV (`.csv`, UTF-8 on ownCloud), `0` = other
-(listed, but `OPEN` refuses it).
+(listed; only `conv 3` can open or save it), `6` = folder (DIR entries only).
 
 **conv** (OPEN and SAVE) says what the X16 side holds:
 
@@ -221,8 +229,9 @@ characters with no ISO-8859-15 form become `?`), `3` = Word (`.docx`),
 | 0 | native bytes (`.txt`/`.csv`: ISO-8859-15 ↔ UTF-8, everything else byte-for-byte) | all types |
 | 1 | RTF for the X16 WP | `.rtf` `.txt` `.docx` |
 | 2 | X16 sheet = "simple XLSX" (commanderx16sheets `SHEETFMT.md`) | `.xlsx` `.csv` |
+| 3 | raw bytes, byte-for-byte both ways, no charset conversion (X16 file manager) | any file, any extension |
 
-conv > 2 is `ERR BAD_ARG`; a conv that doesn't fit the file type is
+conv > 3 is `ERR BAD_ARG`; a conv that doesn't fit the file type is
 `ERR UNSUPPORTED` (checked at `OPEN` / `SAVE`, before any data moves).
 Conversions (hub module in brackets):
 
@@ -260,6 +269,39 @@ sorted case-insensitively, at most 1000 entries). Later pages read from that
 snapshot, so paging is consistent. The hub packs as many entries as fit in
 the client's `maxrx` (≤ `max`).
 
+#### DIR (`$16`)
+```
+req : start u16, max u8, path str      path "" = Documents/ itself
+rep : total u16, start u16, n u8, n × entry      (entry as in LIST)
+```
+Lists **one** folder (not recursive): folders first (type 6, size 0), then files, each group
+sorted case-insensitively, at most 1000 entries. `name` is the entry's own name (no path).
+`start = 0` takes a fresh snapshot of that folder; later pages read from it. Because any file
+can be moved with `conv 3`, flags bit0 (unsupported) is set only for names that can't be sent
+(too long, lossy) and files above 1 MiB, not for type 0. A missing folder, or a file given as
+`path`, is `NOT_FOUND`.
+
+#### MKDIR (`$17`), DELETE (`$18`)
+```
+req : path str          rep : (empty)
+```
+MKDIR: the parent folder must exist (`BAD_NAME "folder does not exist"` otherwise); an existing
+file or folder of that name is `CONFLICT kind 1`. DELETE removes a file, or a folder **with all
+its contents** (the X16 asks the user first); missing = `NOT_FOUND`. `Documents/` itself can't
+be deleted (the empty path is `BAD_NAME`).
+
+#### MOVE (`$19`), COPY (`$1A`)
+```
+req : mode u8, src str, dst str        rep : (empty)
+```
+Server-side WebDAV MOVE/COPY of a file or a whole folder; both names are full paths in
+`Documents/`, so MOVE also renames. `mode 0` fails with `CONFLICT kind 1` (extra: the
+destination's etag) if `dst` exists; `mode 1` replaces it. A file never replaces a folder or
+the other way round (`CONFLICT` even with mode 1). `dst` equal to `src` or inside it is
+`BAD_ARG`; a missing `src` is `NOT_FOUND`; a missing destination folder is `BAD_NAME`.
+Transfers between the X16's SD card and ownCloud use OPEN/READ and SAVE/WRITE/COMMIT with
+`conv 3`.
+
 #### OPEN (`$11`)
 ```
 req : conv u8, name str        conv 0 = native, 1 = RTF, 2 = simple XLSX (see table above)
@@ -293,6 +335,8 @@ COMMIT req : (empty)
   changed since then, or `NOT_FOUND` if it was deleted meanwhile.
   There is deliberately no unconditional overwrite: overwriting always names
   the version being replaced, so a concurrent edit is never lost silently.
+* `conv 3` (raw): any name that passes the name rules, any extension; bytes stored exactly
+  as sent.
 * `conv 0`: bytes are stored as they are (`.txt`/`.csv`: ISO-8859-15 → UTF-8).
   `conv 1`: the content is RTF from the X16 WP. For a `.txt` target the hub
   extracts the plain text (soft-wrapped lines rejoined) and stores it as UTF-8;

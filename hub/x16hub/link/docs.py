@@ -1,4 +1,5 @@
-"""Docs channel (1): LIST / OPEN / READ / SAVE / WRITE / COMMIT on ownCloud Documents/."""
+"""Docs channel (1): LIST / OPEN / READ / SAVE / WRITE / COMMIT on ownCloud Documents/, plus the folder
+ops DIR / MKDIR / DELETE / MOVE / COPY (X16 file manager, Save As folder browser)."""
 from __future__ import annotations
 
 import asyncio
@@ -30,8 +31,11 @@ TZ = ZoneInfo("America/New_York")
 _BAD_CHARS = set('\\:*?"<>|')
 
 T_OTHER, T_RTF, T_TXT, T_DOCX, T_XLSX, T_CSV = 0, 1, 2, 3, 4, 5
+T_DIR = 6                       # DIR entries only: a folder
 _EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": T_CSV}
-# conv 0 = native bytes, 1 = RTF on the X16 side, 2 = X16 sheet (simple XLSX) on the X16 side
+# conv 0 = native bytes, 1 = RTF on the X16 side, 2 = X16 sheet (simple XLSX) on the X16 side,
+# 3 = raw: byte-for-byte, any file type (file manager copies)
+CONV_RAW = 3
 CONV_OK = {T_RTF: (0, 1), T_TXT: (0, 1), T_DOCX: (0, 1), T_XLSX: (0, 2), T_CSV: (0, 2)}
 FL_UNSUPPORTED, FL_LOSSY, FL_TOO_LARGE = 1, 2, 4
 
@@ -58,8 +62,10 @@ def file_type(name: str) -> int:
 
 
 def check_conv(t: int, conv: int) -> None:
-    if conv not in (0, 1, 2):
+    if conv not in (0, 1, 2, CONV_RAW):
         raise DocError(F.E_BAD_ARG, "bad conv")
+    if conv == CONV_RAW:
+        return
     if t == T_OTHER:
         raise DocError(F.E_UNSUPPORTED, "file type not supported")
     if conv not in CONV_OK[t]:
@@ -89,6 +95,11 @@ def wire_name(b: bytes, *, for_save: bool = False) -> str:
     return check_name(b.decode(WP_CHARSET), for_save=for_save)  # every byte decodes; C1 rejected in check
 
 
+def wire_dir(b: bytes) -> str:
+    """A folder path for DIR: empty = Documents/ itself, else the usual name rules."""
+    return wire_name(b) if b else ""
+
+
 def _unix(last_modified: str | None) -> int:
     try:
         return int(parsedate_to_datetime(last_modified).timestamp()) if last_modified else 0
@@ -110,9 +121,11 @@ class Entry:
     size: int
     mtime: int
     etag: str | None
+    is_dir: bool = False
+    raw_ok: bool = False        # DIR: any type can be moved raw (conv 3); "unsupported" = can't transfer
 
     def encode(self) -> bytes:
-        t = file_type(self.name)
+        t = T_DIR if self.is_dir else file_type(self.name)
         wn, lossy = to_wire_text(self.name)
         flags = 0
         if lossy:
@@ -124,7 +137,7 @@ class Entry:
             bad = False
         except DocError:
             bad = True
-        if t == T_OTHER or bad or lossy or len(wn) > MAX_NAME or self.size > MAX_FILE:
+        if (t == T_OTHER and not self.raw_ok) or bad or lossy or len(wn) > MAX_NAME or self.size > MAX_FILE:
             flags |= FL_UNSUPPORTED
         return (bytes([t, flags]) + struct.pack("<II", min(self.size, 0xFFFFFFFF), self.mtime & 0xFFFFFFFF)
                 + _local5(self.mtime) + pstr(wn[:255]))
@@ -166,6 +179,7 @@ class DocsChannel:
     def __init__(self, oc, device: str, pending: PendingUploads, peer_maxrx: int):
         self.oc, self.device, self.pending, self.maxrx = oc, device, pending, peer_maxrx
         self.snapshot: list[Entry] = []
+        self.dir_snapshot: list[Entry] = []
         self.open_data: bytes | None = None
         self.save: dict | None = None
 
@@ -200,6 +214,14 @@ class DocsChannel:
         if op == F.OP_COMMIT:
             r.end()
             return await self.commit()
+        if op == F.OP_DIR:
+            return await self.dir(r)
+        if op == F.OP_MKDIR:
+            return await self.mkdir(r)
+        if op == F.OP_DELETE:
+            return await self.delete(r)
+        if op in (F.OP_MOVE, F.OP_COPY):
+            return await self.transfer(op, r)
         raise DocError(F.E_BAD_OP, "unknown docs op")
 
     # ---- LIST
@@ -233,19 +255,104 @@ class DocsChannel:
         r.end()
         if start == 0:
             self.snapshot = await self._call(self._walk)
-        total = len(self.snapshot)
+        return self._page(self.snapshot, start, mx)
+
+    def _page(self, snap: list[Entry], start: int, mx: int) -> bytes:
+        total = len(snap)
         if start > total:
             raise DocError(F.E_BAD_ARG, "start beyond end of list")
         body = b""
         n = 0
         room = self.maxrx - 5
-        for e in self.snapshot[start:start + max(0, mx)]:
+        for e in snap[start:start + max(0, mx)]:
             enc = e.encode()
             if len(body) + len(enc) > room:
                 break
             body += enc
             n += 1
         return struct.pack("<HHB", total, start, n) + body
+
+    # ---- DIR / MKDIR / DELETE / MOVE / COPY
+    def _dir(self, rel: str) -> list[Entry]:
+        self.oc.ensure_folder(DOCS_ROOT)
+        path = f"{DOCS_ROOT}/{rel}" if rel else DOCS_ROOT
+        st = self.oc.stat(path)
+        if st is None or not st["is_dir"]:
+            raise DocError(F.E_NOT_FOUND, "folder not found")
+        dirs: list[Entry] = []
+        files: list[Entry] = []
+        for it in self.oc.list(path):
+            p = it["path"].rstrip("/")
+            if p == path or not p.startswith(path + "/"):
+                continue
+            leaf = p[len(path) + 1:]
+            if not leaf or "/" in leaf:
+                continue
+            e = Entry(leaf, 0 if it["is_dir"] else it["size"], _unix(it["last_modified"]), it["etag"],
+                      is_dir=it["is_dir"], raw_ok=True)
+            (dirs if e.is_dir else files).append(e)
+        dirs.sort(key=lambda e: e.name.casefold())
+        files.sort(key=lambda e: e.name.casefold())
+        return (dirs + files)[:MAX_LIST]
+
+    async def dir(self, r: Reader) -> bytes:
+        start, mx = r.u16(), r.u8()
+        rel = wire_dir(r.str_())
+        r.end()
+        if start == 0:
+            self.dir_snapshot = await self._call(self._dir, rel)
+        return self._page(self.dir_snapshot, start, mx)
+
+    async def mkdir(self, r: Reader) -> bytes:
+        rel = wire_name(r.str_())
+        r.end()
+        path = f"{DOCS_ROOT}/{rel}"
+        await self._call(self.oc.ensure_folder, DOCS_ROOT)
+        st = await self._call(self.oc.stat, path)
+        if st is not None:
+            raise DocError(F.E_CONFLICT, "already exists",
+                           bytes([F.CONFLICT_EXISTS]) + pstr((st["etag"] or "").encode("ascii", "replace")))
+        await self._call(self.oc.mkcol, path)
+        log.info("device %s made folder %s", self.device, path)
+        return b""
+
+    async def delete(self, r: Reader) -> bytes:
+        rel = wire_name(r.str_())
+        r.end()
+        path = f"{DOCS_ROOT}/{rel}"
+        if await self._call(self.oc.stat, path) is None:
+            raise DocError(F.E_NOT_FOUND, "file not found")
+        await self._call(self.oc.delete, path)
+        log.info("device %s deleted %s", self.device, path)
+        return b""
+
+    async def transfer(self, op: int, r: Reader) -> bytes:
+        from ..backend.owncloud import PreconditionFailed
+        mode = r.u8()
+        src = wire_name(r.str_())
+        dst = wire_name(r.str_())
+        r.end()
+        if mode not in (0, 1):
+            raise DocError(F.E_BAD_ARG, "bad mode")
+        if dst == src or dst.startswith(src + "/"):
+            raise DocError(F.E_BAD_ARG, "can't copy or move a folder into itself")
+        sp, dp = f"{DOCS_ROOT}/{src}", f"{DOCS_ROOT}/{dst}"
+        st = await self._call(self.oc.stat, sp)
+        if st is None:
+            raise DocError(F.E_NOT_FOUND, "file not found")
+        is_dir = st["is_dir"]
+        dst_st = await self._call(self.oc.stat, dp)
+        if dst_st is not None and (mode == 0 or dst_st["is_dir"] != is_dir):
+            # never replace a folder with a file or the other way round
+            raise DocError(F.E_CONFLICT, "already exists",
+                           bytes([F.CONFLICT_EXISTS]) + pstr((dst_st["etag"] or "").encode("ascii", "replace")))
+        fn = self.oc.move if op == F.OP_MOVE else self.oc.copy
+        try:
+            await self._call(fn, sp, dp, overwrite=mode == 1, is_dir=is_dir)
+        except PreconditionFailed:
+            raise DocError(F.E_CONFLICT, "already exists", bytes([F.CONFLICT_EXISTS]) + pstr(b"")) from None
+        log.info("device %s %s %s -> %s", self.device, F.OP_NAMES[op].lower(), sp, dp)
+        return b""
 
     # ---- OPEN / READ
     async def open(self, r: Reader) -> bytes:
@@ -264,7 +371,9 @@ class DocsChannel:
         if len(data) > MAX_FILE:
             raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
         lossy = False
-        if t in (T_TXT, T_CSV) and conv == 0:
+        if conv == CONV_RAW:
+            pass
+        elif t in (T_TXT, T_CSV) and conv == 0:
             data, lossy = to_wire_text(decode_utf8(data))
         elif t == T_TXT:
             data, lossy = text_to_rtf(decode_utf8(data))
@@ -295,15 +404,16 @@ class DocsChannel:
     # ---- SAVE / WRITE / COMMIT
     def save_begin(self, r: Reader) -> bytes:
         mode, conv, size, crc = r.u8(), r.u8(), r.u32(), r.u32()
-        name = wire_name(r.str_(), for_save=True)
+        name_b = r.str_()
         raw_etag = r.str_()
         r.end()
         # the etag ends up in an If-Match header: allow only what ownCloud etags look like
         if not re.fullmatch(rb'(W/)?"?[0-9A-Za-z:._-]{0,64}"?', raw_etag):
             raise DocError(F.E_BAD_ARG, "bad etag")
         etag = raw_etag.decode("ascii")
-        if mode not in (0, 1) or conv not in (0, 1, 2):
+        if mode not in (0, 1) or conv not in (0, 1, 2, CONV_RAW):
             raise DocError(F.E_BAD_ARG, "bad mode/conv")
+        name = wire_name(name_b, for_save=conv != CONV_RAW)    # raw copies may have any extension
         check_conv(file_type(name), conv)
         if mode == 1 and not etag:
             raise DocError(F.E_BAD_ARG, "overwrite needs the etag being replaced")
@@ -339,7 +449,9 @@ class DocsChannel:
             raise DocError(F.E_BAD_CHECKSUM, "upload size/CRC32 mismatch; send it again")
         t, conv = file_type(s["name"]), s["conv"]
         try:
-            if t in (T_TXT, T_CSV) and conv == 0:
+            if conv == CONV_RAW:
+                pass
+            elif t in (T_TXT, T_CSV) and conv == 0:
                 data = data.decode(WP_CHARSET).encode("utf-8")
             elif t == T_TXT:
                 data = rtf_to_text(data, WP_CHARSET).encode("utf-8")

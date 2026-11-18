@@ -111,6 +111,35 @@ class Client:
             start += n
         return total or 0, out
 
+    async def dir(self, path: str = "", page: int = 255) -> tuple[int, list[ListEntry]]:
+        """DIR: one folder of Documents/ (folders first, type 6), all pages."""
+        out: list[ListEntry] = []
+        start, total = 0, None
+        while total is None or start < total:
+            r = Reader(await self.request(F.CH_DOCS, F.OP_DIR, struct.pack("<HB", start, page) + pstr(path)))
+            total, _st, n = r.u16(), r.u16(), r.u8()
+            for _ in range(n):
+                t, fl, size, mt = r.u8(), r.u8(), r.u32(), r.u32()
+                loc = tuple(r.raw(5))
+                out.append(ListEntry(t, fl, size, mt, loc, r.str_().decode("iso8859_15")))
+            r.end()
+            if n == 0:
+                break
+            start += n
+        return total or 0, out
+
+    async def mkdir(self, path: str) -> None:
+        await self.request(F.CH_DOCS, F.OP_MKDIR, pstr(path))
+
+    async def delete(self, path: str) -> None:
+        await self.request(F.CH_DOCS, F.OP_DELETE, pstr(path))
+
+    async def move(self, src: str, dst: str, mode: int = 0) -> None:
+        await self.request(F.CH_DOCS, F.OP_MOVE, bytes([mode]) + pstr(src) + pstr(dst))
+
+    async def copy(self, src: str, dst: str, mode: int = 0) -> None:
+        await self.request(F.CH_DOCS, F.OP_COPY, bytes([mode]) + pstr(src) + pstr(dst))
+
     async def open(self, name: str, conv: int = 0) -> dict:
         r = Reader(await self.request(F.CH_DOCS, F.OP_OPEN, bytes([conv]) + pstr(name)))
         t, fl, size, crc, mt = r.u8(), r.u8(), r.u32(), r.u32(), r.u32()

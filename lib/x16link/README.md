@@ -14,6 +14,7 @@ clean TCP) and hangs up with the guarded `+++` / `ATH`. In the emulator,
 |---|---|---|
 | `x16link.p8` (+ `lk_link`, `lk_uart`, `lk_crypto`, `lk_util`) | `X16LINK.BIN`, RAM bank **60** | Transport: key file, dial, HMAC-SHA256 mutual auth, sets the RTC from the hub's TIME, framed request/reply with retransmit |
 | `x16docs.p8` (+ `lk_docs`) | `X16DOCS.BIN`, RAM bank **61** | Docs channel: LIST with page cache and picker rows, download (OPEN+READ to an SD file, CRC-32, resume), upload (SAVE+WRITE+COMMIT, resume, conflict info) |
+| `lk_fs.p8` | compiled **into the app** (or an app's bank library) | Folder ops of the docs channel: `lkfs.dir_begin/entry/name/is_dir` (one folder, paged, small cache), `mkdir`, `delete`, `move`, `copy`, path helpers `join/up/leaf`. Reconnects once if the hub dropped an idle session. Used by X16 Files and the Save As browsers of X16 Write / X16 Sheets |
 | `x16cal.p8` | compiled **into the app** | Calendar channel: `lkcal.sync(events, counter)` for the calendar's 128-slot CALENDAR.DAT, plus the conflict list and acknowledgements |
 | `x16link_api.p8` | app side | `lkload.load()` loads both banks from the SD card. `lkload.load_link()` loads only X16LINK.BIN (the calendar uses this) |
 | `x16link_ext.p8` | app side | `lkapi.*` extsub declarations of both jump tables |
@@ -49,7 +50,7 @@ or in another bank, not in the transport.
 | `hangup()` / `forget()` | BYE + modem hangup / wipe the key from RAM (call it when you're done) |
 | `link_error(dst, max)` | Last error text (ISO-8859-1) |
 | `list_begin/list_total/list_row/list_name` | Docs picker (X16DOCS.BIN) |
-| `download(remote, local, conv)` / `upload(local, remote, mode, conv)` | Docs transfer. `conv 1` = RTF on the X16 side (.rtf .txt .docx), `conv 2` = simple XLSX (.xlsx .csv, see X16 Sheets SHEETFMT.md) |
+| `download(remote, local, conv)` / `upload(local, remote, mode, conv)` | Docs transfer. `conv 1` = RTF on the X16 side (.rtf .txt .docx), `conv 2` = simple XLSX (.xlsx .csv, see X16 Sheets SHEETFMT.md), `conv 3` = raw bytes, any file type (X16 Files) |
 | `get_etag/set_etag/conflict` | Overwrite-if-unchanged and the conflict kind/etag after status 8 |
 
 Local statuses: 32 no/bad key file, 33 no serial card, 34 no modem, 35 can't reach the hub,

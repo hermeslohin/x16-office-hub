@@ -287,3 +287,53 @@ def test_cli_refuses_world_readable_creds(creds, monkeypatch, capsys):
     assert rc == 1
     assert "chmod 600" in out.out + out.err
     assert PW not in out.out + out.err
+
+
+# ----------------------------------------------------------------- MOVE / COPY / DELETE requests
+
+class _Resp:
+    def __init__(self, status):
+        self.status_code, self.headers, self.text = status, {}, ""
+
+    def iter_content(self, n):
+        return iter(())
+
+    def close(self):
+        pass
+
+
+class _Sess:
+    def __init__(self, status=201):
+        self.calls, self.status = [], status
+        self.headers = {}
+
+    def request(self, method, url, headers=None, **kw):
+        self.calls.append((method, url, dict(headers or {})))
+        return _Resp(self.status)
+
+
+def test_move_copy_send_destination_inside_files_root(creds):
+    s = _Sess()
+    o = oc.OwnCloud(oc.load_config(creds), session=s)
+    o.move("Documents/a b.rtf", "Documents/Letters/a b.rtf")
+    o.copy("Documents/dir", "Documents/dir2", overwrite=True, is_dir=True)
+    (m1, u1, h1), (m2, u2, h2) = s.calls
+    root = "https://oc.example.lan/remote.php/dav/files/x16hub/"
+    assert m1 == "MOVE" and u1 == root + "Documents/a%20b.rtf"
+    assert h1["Destination"] == root + "Documents/Letters/a%20b.rtf" and h1["Overwrite"] == "F"
+    assert m2 == "COPY" and u2 == root + "Documents/dir/" and h2["Destination"] == root + "Documents/dir2/"
+    assert h2["Overwrite"] == "T" and h2["Depth"] == "infinity"
+
+
+def test_move_412_is_precondition_and_root_ops_refused(creds):
+    o = oc.OwnCloud(oc.load_config(creds), session=_Sess(412))
+    with pytest.raises(oc.PreconditionFailed):
+        o.move("Documents/a", "Documents/b")
+    s = _Sess(204)
+    o = oc.OwnCloud(oc.load_config(creds), session=s)
+    for bad in (lambda: o.delete(""), lambda: o.delete("/"), lambda: o.move("", "x"), lambda: o.copy("x", "/")):
+        with pytest.raises(oc.OCError):
+            bad()
+    with pytest.raises(oc.OCError):
+        o.move("Documents/a", "Documents/../../etc")
+    assert s.calls == []

@@ -6,7 +6,7 @@ UART/Zimodem link) and the suite's **ownCloud Server 11 (Classic)** at
 
 | Data | Protocol | Where on ownCloud |
 |---|---|---|
-| Word-processor docs, sheets (`.rtf .txt .docx .xlsx .csv`) | WebDAV | `/remote.php/dav/files/x16hub/Documents/` (created if missing) |
+| Word-processor docs, sheets (`.rtf .txt .docx .xlsx .csv`), any file from X16 Files (raw, folders too) | WebDAV | `/remote.php/dav/files/x16hub/Documents/` (created if missing) |
 | Calendar | CalDAV | `/remote.php/dav/calendars/x16hub/x16/` (calendar "X16", created if missing) |
 
 The X16s reach the hub over **X16Link** (`python -m x16hub serve`, TCP port 6502, protocol in

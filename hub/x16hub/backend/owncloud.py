@@ -393,8 +393,25 @@ class OwnCloud:
         self._req("MKCOL", self.file_url(path) + "/", ok=(201,))
 
     def delete(self, path: str, *, if_match: str | None = None) -> None:
+        if not join_path(path):
+            raise OCError("refusing to DELETE the files root")
         h = {"If-Match": norm_etag(if_match)} if if_match else {}
         self._req("DELETE", self.file_url(path), ok=(204,), headers=h)
+
+    def _transfer(self, method: str, src: str, dst: str, overwrite: bool, is_dir: bool) -> None:
+        """WebDAV MOVE/COPY inside the user's files. Overwrite F -> 412 PreconditionFailed if dst exists."""
+        if not join_path(src) or not join_path(dst):
+            raise OCError(f"{method}: empty source or destination")
+        tail = "/" if is_dir else ""
+        self._req(method, self.file_url(src) + tail, ok=(201, 204),
+                  headers={"Destination": self.file_url(dst) + tail, "Overwrite": "T" if overwrite else "F",
+                           "Depth": "infinity"})
+
+    def move(self, src: str, dst: str, *, overwrite: bool = False, is_dir: bool = False) -> None:
+        self._transfer("MOVE", src, dst, overwrite, is_dir)
+
+    def copy(self, src: str, dst: str, *, overwrite: bool = False, is_dir: bool = False) -> None:
+        self._transfer("COPY", src, dst, overwrite, is_dir)
 
     def ensure_folder(self, path: str = DOCS_FOLDER) -> bool:
         """Create the folder if missing. Returns True if it was created."""

@@ -20,6 +20,8 @@ Apps (separate repos, each with a vendored copy of `lib/x16link`):
 
 * **X16 Write** (word processor, Open/Save As to ownCloud): https://github.com/hermeslohin/commanderx16wp
 * **Calendar** (F1 sync with a CalDAV calendar): https://github.com/hermeslohin/commanderx16calendar
+* **X16 Files** (file manager: SD card <-> ownCloud, folders, copy/move/rename/delete): `commanderx16fm`
+* **X16 Sheets** (spreadsheet, Open/Save As to ownCloud): `commanderx16sheets`
 
 The apps' end-to-end tests expect them checked out under `apps/wp` and `apps/calendar` (git-ignored here).
 
