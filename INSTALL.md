@@ -12,8 +12,9 @@ X16 (TexElec serial/ESP32 card) --Wi-Fi/TCP 6502--> x16hub container --HTTPS--> 
 * **A Linux machine on the same LAN as the X16** with Docker Engine and the Compose plugin
   (`docker compose version` works). A Raspberry Pi 4/5 is fine; the image is built for amd64
   and arm64.
-  Docker Desktop on macOS or Windows is fine for trying the hub, but not for serving a real X16:
-  it can't give the container host networking, so the hub can't see the X16's real IP address.
+  Docker Desktop on macOS or Windows works too, but the hub then sees every connection as
+  coming from one Docker address. That's fine for one X16, but repeated failed logins block all
+  X16s at once, and the firewall step below is Linux-only.
 * **An ownCloud server** reachable over **HTTPS** from that machine (step 1).
 * **An X16 with the TexElec X16 Serial & ESP32 Network Card** (Zimodem firmware), on a Wi-Fi
   network that can reach the Linux machine.
@@ -32,6 +33,8 @@ Everything goes in one folder in your home directory, `~/x16hub`:
 | `~/x16hub/secrets/x16link.keys` | `/secrets/x16link.keys` | One secret key per X16 | The hub (step 6) |
 | `~/x16hub/data/hub.db` | `/data/hub.db` | Sync state and hub settings | The hub |
 | `~/x16hub/sd-staging/X16LINK.KEY` | `/sd/X16LINK.KEY` | Key file to copy to the X16's SD card, then delete | The hub (step 6) |
+| `/usr/local/sbin/x16hub-firewall` | | Firewall rules for port 6502 (your LAN only) | You (step 7) |
+| `/etc/systemd/system/x16hub-firewall.service` | | Loads those rules whenever Docker starts | You (step 7) |
 
 The hub checks these permissions every time it starts. If `secrets/` is readable by other
 users, or the files aren't owned by the user the container runs as, it stops with a message
@@ -193,26 +196,10 @@ calendar event. It leaves behind an empty `X16` folder and the `X16` calendar. I
 
 ## Step 6: Connect the X16
 
-### 6a. Tell the hub which address to listen on
+The hub itself needs no address settings: the container listens on port 6502 and the
+firewall (step 7) decides who may reach it. The X16 only needs to know where to dial.
 
-The X16 connects to your Linux machine's LAN IP address. Find it:
-
-```sh
-hostname -I        # the first address is usually it, e.g. 192.168.1.10
-```
-
-Then save it, and the network your X16's Wi-Fi is on, in the hub's settings.
-Replace the example addresses with yours:
-
-```sh
-docker compose run --rm x16hub config set bind 192.168.1.10
-docker compose run --rm x16hub config set allow 192.168.1.0/24
-docker compose run --rm x16hub config show
-```
-
-`allow` only accepts private LAN ranges. Anything else is refused.
-
-### 6b. Create the X16's key file
+### 6a. Create the X16's key file
 
 Each X16 gets its own secret key. This command adds it to `secrets/x16link.keys` and writes the
 matching **`X16LINK.KEY`** for the SD card into `~/x16hub/sd-staging/`:
@@ -221,8 +208,11 @@ matching **`X16LINK.KEY`** for the SD card into `~/x16hub/sd-staging/`:
 docker compose run --rm x16hub link key new x16-office --sdcard /sd --host 192.168.1.10:6502
 ```
 
-(`x16-office` is the device name: up to 16 letters, digits, `-` or `_`. `--host` is the address
-from 6a, plus `:6502`.)
+* `x16-office` is the device name: up to 16 letters, digits, `-` or `_`.
+* `--host` is where the X16 dials: this machine's LAN address plus `:6502`. `hostname -I`
+  shows the address (the first one is usually right). A DNS name that your Wi-Fi network
+  resolves, such as `hubhost.lan:6502`, works too, and keeps working if the IP changes.
+  Give the machine a fixed DHCP lease if you use the IP.
 
 Copy the file to the **root of the X16's SD card**, next to the apps, then delete the staging
 copy:
@@ -235,7 +225,7 @@ shred -u ~/x16hub/sd-staging/X16LINK.KEY
 Anyone holding that SD card can act as your X16 towards the hub. If a card is lost, revoke its
 key with `docker compose run --rm x16hub link key rm x16-office`.
 
-### 6c. Set up the ESP32 (once)
+### 6b. Set up the ESP32 (once)
 
 On the X16, open a terminal program on the serial card and enter:
 
@@ -250,7 +240,84 @@ The apps dial the address in `X16LINK.KEY` themselves.
 
 ---
 
-## Step 7: Start the hub
+## Step 7: Firewall port 6502
+
+The hub must only be reachable from your LAN (the X16 link is authenticated but not
+encrypted). Allow the network your X16's Wi-Fi is on and drop everyone else.
+
+> **ufw, firewalld zones and ordinary `INPUT` rules do not protect Docker ports.** Docker
+> forwards published ports before those rules see the traffic. Rules for containers must go in
+> Docker's **`DOCKER-USER`** chain, which is what the script below does.
+
+Save this as `/usr/local/sbin/x16hub-firewall`. Change `ALLOW` to your X16's network; several
+networks are separated by spaces, e.g. `"192.168.1.0/24 10.0.20.0/24"`:
+
+```sh
+#!/bin/sh
+# Only ALLOW may reach the x16hub container's published port; everyone else is dropped.
+set -eu
+ALLOW="192.168.1.0/24"
+PORT=6502
+
+# The rule matches the port the client dialled (before Docker rewrote it), new
+# connections only, so the hub's replies and its own HTTPS to ownCloud are untouched.
+MATCH="-p tcp -m conntrack --ctorigdstport $PORT --ctdir ORIGINAL"
+
+case "${1:-start}" in
+start)
+    iptables -N X16HUB 2>/dev/null || iptables -F X16HUB
+    for net in $ALLOW; do iptables -A X16HUB -s "$net" -j RETURN; done
+    iptables -A X16HUB -j DROP
+    iptables -C DOCKER-USER $MATCH -j X16HUB 2>/dev/null || iptables -I DOCKER-USER $MATCH -j X16HUB
+    ;;
+stop)
+    iptables -D DOCKER-USER $MATCH -j X16HUB 2>/dev/null || true
+    iptables -F X16HUB 2>/dev/null || true
+    iptables -X X16HUB 2>/dev/null || true
+    ;;
+esac
+```
+
+Then make it run every time Docker starts. Save this as
+`/etc/systemd/system/x16hub-firewall.service`:
+
+```ini
+[Unit]
+Description=Firewall for the x16hub container (TCP 6502)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/x16hub-firewall start
+ExecStop=/usr/local/sbin/x16hub-firewall stop
+
+[Install]
+WantedBy=docker.service
+```
+
+```sh
+sudo chmod 755 /usr/local/sbin/x16hub-firewall
+sudo systemctl daemon-reload
+sudo systemctl enable --now x16hub-firewall
+sudo iptables -L X16HUB -n -v          # your networks -> RETURN, then DROP; counters show hits
+```
+
+To change the allowed networks, edit `ALLOW` and run `sudo systemctl restart x16hub-firewall`.
+
+This works on Docker's default `iptables` setup, including Debian/Ubuntu/Raspberry Pi OS where
+`iptables` is the nftables-backed version. If your router also has a firewall, it must let the
+X16's Wi-Fi network reach this machine on TCP 6502.
+
+The hub also has its own allow-list as a second layer. By default it only accepts
+private LAN addresses (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`), so you normally don't
+need to change it.
+
+---
+
+## Step 8: Start the hub
 
 ```sh
 cd ~/x16hub
@@ -258,7 +325,8 @@ docker compose up -d
 docker compose logs -f          # Ctrl+C stops watching; the hub keeps running
 ```
 
-You should see `x16link listening on 192.168.1.10:6502` (your address). On the X16, open X16 Write and use
+You should see `x16link listening on ('0.0.0.0', 6502)`. From another machine that is *not* in
+`ALLOW`, the port should not answer (`nc -vz -w 3 192.168.1.10 6502` times out). On the X16, open X16 Write and use
 **Open** or **Save As**, or press **F1** in the calendar. Each connection shows up in the log.
 
 The container restarts on its own after a crash or a reboot (as long as Docker starts at boot:
@@ -272,10 +340,10 @@ The container restarts on its own after a crash or a reboot (as long as Docker s
 |---|---|
 | See the log | `docker compose logs -f` |
 | Stop / start | `docker compose stop` / `docker compose up -d` |
-| Apply a `config set` change | `docker compose restart` (settings are read at start; keys aren't, they apply immediately) |
+| Change who may connect | edit `ALLOW` in `/usr/local/sbin/x16hub-firewall`, then `sudo systemctl restart x16hub-firewall` |
 | Update to the newest image | `docker compose pull && docker compose up -d` |
 | List X16 device names | `docker compose run --rm x16hub link key list` |
-| Add another X16 | step 6b with a new device name |
+| Add another X16 | step 6a with a new device name (no restart needed) |
 | Re-test ownCloud | `docker compose run --rm x16hub oc check` |
 | Calendar sync status | `docker compose run --rm --entrypoint python x16hub -m x16hub.calsync status` |
 
@@ -302,15 +370,16 @@ on ownCloud.
 The same thing with plain `docker run`:
 
 ```sh
-docker run -d --name x16hub --restart unless-stopped --network host \
+docker run -d --name x16hub --restart unless-stopped -p 0.0.0.0:6502:6502 \
   --user "$(id -u):$(id -g)" \
   -v ~/x16hub/secrets:/secrets -v ~/x16hub/data:/data -v ~/x16hub/sd-staging:/sd \
   --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
   ghcr.io/hermeslohin/x16-office-hub:latest
 ```
 
-For one-off commands, replace `-d --name x16hub --restart unless-stopped` with `--rm` and add
-the command after the image name, for example `... x16-office-hub:latest oc check`.
+For one-off commands, replace `-d --name x16hub --restart unless-stopped -p 0.0.0.0:6502:6502`
+with `--rm` and add the command after the image name, for example
+`... x16-office-hub:latest oc check`.
 
 ---
 
@@ -327,10 +396,11 @@ the command after the image name, for example `... x16-office-hub:latest oc chec
 | `TLS verification failed` | `ca_file` doesn't match the certificate ownCloud presents. Use the CA that signed it (step 1d), and make sure `base_url` uses the same name as the certificate. |
 | `oc check` fails with 401 | Wrong `username` or `app_password`, or the app password was revoked. Create a new one (step 1c). |
 | `base_url must be a plain https://host[/path] URL` | Use `https://`, without a user name, `?` or `#` in it. |
-| X16 can't connect | Check `config show`: `bind` must be this machine's LAN IP, `allow` must include the X16's network. Run `docker compose restart` after changing either. Make sure no firewall blocks TCP 6502, and that the `HOST=` line in `X16LINK.KEY` matches. |
-| Log shows `auth failed from ...` | The SD card's `X16LINK.KEY` doesn't match the hub's key (for example after running `key new` again). Redo step 6b and copy the new file. |
+| X16 can't connect, nothing in the log | The `HOST=` line in `X16LINK.KEY` must be this machine's current address plus `:6502`. `ALLOW` in the firewall script must include the X16's network: `sudo iptables -L X16HUB -n -v` shows which rule the attempts hit. Your router's firewall may also block it. |
+| Log shows `refused ...: not in allow-list` | The X16's address isn't a private LAN address. Add its network to the hub's list too: `docker compose run --rm x16hub config set allow 192.168.0.0/16,<your network>`, then `docker compose restart`. |
+| Log shows `auth failed from ...` | The SD card's `X16LINK.KEY` doesn't match the hub's key (for example after running `key new` again). Redo step 6a and copy the new file. |
 | An address gets blocked | 5 failed connections in 10 minutes block that address for 10 minutes. Fix the cause, then wait, or run `docker compose restart`. |
-| `warning: no device keys` | No X16 has a key yet. Do step 6b. |
+| `warning: no device keys` | No X16 has a key yet. Do step 6a. |
 
 More details on the hub itself (protocol, limits, calendar conflicts) are in
 [`hub/README.md`](hub/README.md) and [`PROTOCOL.md`](PROTOCOL.md).

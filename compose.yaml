@@ -10,9 +10,10 @@ services:
     # build: /path/to/x16-office-hub
     container_name: x16hub
     restart: unless-stopped
-    # Host networking: the hub sees each X16's real IP address (needed for its allow-list and
-    # per-address limits) and listens on the LAN address set with `config set bind`.
-    network_mode: host
+    # IPv4 only (Zimodem is IPv4). Restrict who can reach this port with the firewall rules in
+    # INSTALL.md step 7: ufw and plain INPUT rules do NOT apply to published Docker ports.
+    ports:
+      - "0.0.0.0:6502:6502"
     # Must be the owner of ./secrets and ./data (run `id -u` and `id -g` on the host).
     user: "${X16HUB_UID:-1000}:${X16HUB_GID:-1000}"
     volumes:

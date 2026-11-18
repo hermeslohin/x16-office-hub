@@ -64,5 +64,8 @@ USER 1000:1000
 # No HEALTHCHECK on purpose: a probe that connects without authenticating counts as a failed
 # handshake, and 5 of those in 10 minutes block the probing address.
 
+# Listen on all of the container's interfaces; publish the port with `-p 6502:6502` and restrict
+# who can reach it with the host firewall (INSTALL.md, step 7). The hub's own allow-list
+# (private ranges by default) still applies on top.
 ENTRYPOINT ["python", "-m", "x16hub"]
-CMD ["serve"]
+CMD ["serve", "--bind", "0.0.0.0"]
