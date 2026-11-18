@@ -97,10 +97,10 @@ def cmd_link_ls(a):
         c = await _link_client(a)
         total, items = await c.list()
         await c.close()
-        kinds = {0: "other", 1: "rtf", 2: "txt"}
+        kinds = {0: "other", 1: "rtf", 2: "txt", 3: "docx", 4: "xlsx", 5: "csv"}
         for e in items:
             y, mo, d, h, mi = e.local
-            print(f"{kinds[e.type]:<5} {'U' if e.flags & 1 else ' '} {e.size:>8} 20{y:02d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d} {e.name}")
+            print(f"{kinds.get(e.type, "?"):<5} {'U' if e.flags & 1 else ' '} {e.size:>8} 20{y:02d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d} {e.name}")
         print(f"{total} file(s)")
     asyncio.run(go())
 
