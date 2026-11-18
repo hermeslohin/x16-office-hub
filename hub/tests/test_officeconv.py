@@ -516,6 +516,30 @@ def test_generic_rtf_table_to_docx():
     assert [t for t, _, _ in paras_of(root)][0] == "Intro" and [t for t, _, _ in paras_of(root)][-1] == "End"
 
 
+# ====================================================================== font sizes
+
+WP_SIZES = (pathlib.Path(__file__).parent / "fixtures" / "wp_sizes.rtf").read_bytes()   # X16 Write's sizetest
+
+
+def test_docx_font_sizes_to_wp():
+    body = "<w:p>" + r("eleven", '<w:sz w:val="22"/>') + r("sixteen", '<w:sz w:val="32"/>') + \
+        r("twentyfour", '<w:sz w:val="48"/>') + r("forty", '<w:sz w:val="80"/>') + r("plain") + "</w:p>"
+    rtf, _ = D.docx_to_rtf(make_docx(body))
+    line = rtf.decode("latin-1").split("viewkind1\r\n")[1].split("\r\n")[0]
+    assert line == "\\pard\\plain\\ql\\li0\\fs24 eleven\\fs36 sixteen\\fs48 twentyfour\\fs72 forty\\fs24 plain\\par"
+    assert [D.wp_size(n) for n in (None, 20, 29, 30, 41, 42, 59, 60, 144)] == [24, 24, 24, 36, 36, 48, 48, 72, 72]
+
+
+def test_wp_sizes_roundtrip():
+    root, _ = doc_xml(D.wp_rtf_to_docx(WP_SIZES))
+    sizes = {t: p.get("sz") for t, _, runs in paras_of(root) for t, p in runs}
+    assert sizes["Big 36 "] == "72" and sizes["Large 24"] == "48" and sizes["Medium 18 pt"] == "36"
+    assert sizes["Normal"] is None                                  # 12 pt is the document default
+    back, lossy = D.docx_to_rtf(D.wp_rtf_to_docx(WP_SIZES))
+    s = back.decode("latin-1")
+    assert not lossy and "\\fs72 Big 36" in s and "\\fs48 Large 24" in s and "\\fs36 Medium 18 pt" in s
+
+
 def test_docx_hostile_inputs():
     with pytest.raises(ConvError):
         D.docx_to_rtf(b"PK\x05\x06" + bytes(18))

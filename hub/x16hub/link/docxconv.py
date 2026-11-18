@@ -20,7 +20,8 @@ wp_rtf_to_docx(data) -> bytes
 docx_to_rtf(data) -> (bytes, lossy)
     Any DOCX -> RTF the WP importer reads: the WP fonttbl and 16-colour palette,
     one \\pard\\plain ... \\par per paragraph (no xwp tags, the WP re-wraps),
-    \\qc/\\qr/\\ql, \\li level*576, \\b \\i \\ul \\fN \\cfN \\highlightN, \\'xx in
+    \\qc/\\qr/\\ql, \\li level*576, \\b \\i \\ul \\fN \\cfN \\highlightN, font sizes as the
+    nearest of the WP's 12/18/24/36 pt (\\fs24/36/48/72), \\'xx in
     ISO-8859-15 ('?' + lossy for anything else, typographic punctuation folded).
     Lists become text markers; page breaks become \\pagebb on the following
     paragraph (the WP importer ignores \\page as a paragraph break); a manual line
@@ -597,7 +598,17 @@ def _apply_rpr(el, base: dict) -> dict:
                 d["shd"] = f
         elif tag == "rFonts":
             d["font"] = ch.get(_W + "ascii") or ch.get(_W + "hAnsi") or d.get("font")
+        elif tag == "sz":
+            v = ch.get(_W + "val") or ""
+            if v.isdigit():
+                d["sz"] = int(v)
     return d
+
+
+def wp_size(half_points: int | None) -> int:
+    """the X16 WP's sizes: 12, 18, 24 or 36 pt, as \\fs (half points), the nearest to a Word size"""
+    hp = half_points or 24
+    return 24 if hp < 30 else 36 if hp < 42 else 48 if hp < 60 else 72
 
 
 def _apply_ppr(el, base: dict) -> dict:
@@ -959,7 +970,7 @@ def _split_long(paras: list[_OutPara]) -> tuple[list[_OutPara], bool]:
 def _segs_rtf(segs: list, bullets: bool) -> tuple[bytes, bool]:
     """runs (props dict, text) -> RTF text with \\b \\i \\ul \\fN \\cfN \\highlightN, as after \\plain."""
     out, lossy = bytearray(), False
-    cur = (False, False, False, 0, 0, 1)            # b i u font fg bg (palette indices), as after \plain
+    cur = (False, False, False, 0, 0, 1, 24)        # b i u font fg bg (palette indices) fs, as after \plain\fs24
     for k, (pr, text) in enumerate(segs):
         if bullets and k == 0 and pr == {} and text[:1] in _BULLET_RTF:
             out += _BULLET_RTF[text[0]].encode() + text[1:].encode("ascii")
@@ -967,7 +978,8 @@ def _segs_rtf(segs: list, bullets: bool) -> tuple[bytes, bool]:
         fg = nearest_palette(pr["color"]) if pr.get("color") else 0
         hl = pr.get("hl") or pr.get("shd")
         bg = nearest_palette(hl) if hl else 1
-        want = (bool(pr.get("b")), bool(pr.get("i")), bool(pr.get("u")), _font_idx(pr.get("font")), fg, bg)
+        want = (bool(pr.get("b")), bool(pr.get("i")), bool(pr.get("u")), _font_idx(pr.get("font")), fg, bg,
+                wp_size(pr.get("sz")))
         if want != cur:
             cw = b""
             if want[0] != cur[0]:
@@ -982,6 +994,8 @@ def _segs_rtf(segs: list, bullets: bool) -> tuple[bytes, bool]:
                 cw += b"\\cf%d" % (want[4] + 1)
             if want[5] != cur[5]:
                 cw += b"\\highlight%d" % (0 if want[5] == 1 else want[5] + 1)
+            if want[6] != cur[6]:
+                cw += b"\\fs%d" % want[6]
             out += cw + b" "
             cur = want
         s = text.translate(_FOLD)

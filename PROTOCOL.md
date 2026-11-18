@@ -236,7 +236,8 @@ conv > 3 is `ERR BAD_ARG`; a conv that doesn't fit the file type is
 Conversions (hub module in brackets):
 
 * `.docx` conv 1 [`docxconv`]: OPEN → RTF in the WP dialect (WP fonttbl, the WP's
-  16-colour colortbl, `\b \i \ul \fN \cfN \highlightN`, `\qc/\qr`, `\li` = level × 576,
+  16-colour colortbl, `\b \i \ul \fN \cfN \highlightN`, sizes as the nearest WP size
+  `\fs24/36/48/72` (12/18/24/36 pt), `\qc/\qr`, `\li` = level × 576,
   `\pagebb` for page breaks, list markers as text, tables as WP table rows
   `\trowd`..`\cellx`..`\intbl`..`\cell`..`\row` (equal widths, first row `\trhdr`; more than 8
   columns merged into the 8th, a cell's paragraphs joined with spaces), no `{\*\xwp}` tags so the
