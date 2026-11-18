@@ -1,0 +1,31 @@
+# x16hub with Docker Compose. Copy this file to ~/x16hub/compose.yaml (see INSTALL.md).
+#
+#   docker compose up -d          start (and again after a config change: docker compose restart)
+#   docker compose logs -f        live log
+#   docker compose run --rm x16hub oc check        any other hub command
+services:
+  x16hub:
+    image: ghcr.io/hermeslohin/x16-office-hub:latest
+    # To build locally instead of pulling, uncomment and point at your checkout:
+    # build: /path/to/x16-office-hub
+    container_name: x16hub
+    restart: unless-stopped
+    # Host networking: the hub sees each X16's real IP address (needed for its allow-list and
+    # per-address limits) and listens on the LAN address set with `config set bind`.
+    network_mode: host
+    # Must be the owner of ./secrets and ./data (run `id -u` and `id -g` on the host).
+    user: "${X16HUB_UID:-1000}:${X16HUB_GID:-1000}"
+    volumes:
+      - ./secrets:/secrets
+      - ./data:/data
+      - ./sd-staging:/sd
+    environment:
+      X16HUB_LOG: INFO
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 64

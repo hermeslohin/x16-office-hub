@@ -31,7 +31,13 @@ such as the ownCloud URL, CA file, bind address and allow-list lives in `secrets
 `hub.db`, never in the repo. Examples in the docs use placeholders (`owncloud.example.lan`,
 `192.168.1.10`).
 
-## Quick start
+## Install (Docker)
+
+To run the hub for your own X16, follow **[INSTALL.md](INSTALL.md)**: ownCloud setup, the
+credentials file, pulling `ghcr.io/hermeslohin/x16-office-hub` (or building the `Dockerfile`)
+and connecting the X16. `compose.yaml` is the ready-made Compose file.
+
+## Quick start (development)
 
 ```sh
 cd hub && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt

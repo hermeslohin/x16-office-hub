@@ -1,0 +1,9 @@
+# Only hub/ code goes into the image. Never send secrets or state to the build context.
+**
+!hub/requirements.txt
+!hub/requirements-dev.txt
+!hub/x16hub/**
+!hub/tests/**
+**/__pycache__
+**/*.pyc
+hub/x16hub/_shelved_google
