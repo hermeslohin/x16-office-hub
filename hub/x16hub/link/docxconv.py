@@ -16,6 +16,10 @@ wp_rtf_to_docx(data) -> bytes
     Tables (\\trowd .. \\cellx .. \\intbl .. \\cell .. \\row, as X16 Write writes them, up to
     8 x 20) become a w:tbl with single borders, the \\cellx widths, \\trhdr as a header
     row; a paragraph follows every table (Word needs one).
+    Pictures: a {\\*\\xwpbmx HEX} group (X16 Write's BMX picture, see bmx.py) becomes a centered
+    paragraph with an inline PNG (the BMX's own resolution, word/media/imageN.png with its
+    relationship and content type), sized by the rule shared with X16 Write (80 X16 page pixels
+    per inch, scaled to fit 496 x 640). A BMX that doesn't parse is dropped (the save goes on).
 
 docx_to_rtf(data) -> (bytes, lossy)
     Any DOCX -> RTF the WP importer reads: the WP fonttbl and 16-colour palette,
@@ -29,8 +33,15 @@ docx_to_rtf(data) -> (bytes, lossy)
     tables (\\trowd .. \\cell .. \\row with equal \\cellx widths, the first row \\trhdr):
     a cell's paragraphs are joined with spaces, more than 8 columns are merged into
     the 8th and a cell longer than the WP's cell width is cut by the WP (lossy),
-    nested tables are flattened into their cell (lossy); images/objects/footnotes
-    are dropped (lossy); paragraphs longer than the WP's 1024-char buffer are split.
+    nested tables are flattened into their cell (lossy); footnotes, charts, shapes and text
+    boxes are dropped (lossy); paragraphs longer than the WP's 1024-char buffer are split.
+    Pictures (w:drawing a:blip r:embed, VML v:imagedata r:id, mc:AlternateContent -> the first
+    branch that has one) in PNG / JPEG / GIF / BMP become X16 Write BMX groups {\\*\\xwpbmx HEX}
+    (8 bpp, scaled down to fit 320 x 240) at their position, between paragraphs: a picture
+    inside a paragraph splits it (text before, the picture, text after, both parts keeping the
+    paragraph's formatting). Lossy: pictures Pillow can't read (EMF/WMF, ...), pictures in
+    tables, and every picture once the document's BMX total would pass 160,000 bytes (the X16's
+    picture memory); at most 256 pictures are looked at.
 """
 from __future__ import annotations
 
@@ -38,6 +49,7 @@ import re
 from dataclasses import dataclass, field
 from xml.sax.saxutils import escape as _xesc
 
+from . import bmx
 from .ooxml import (PART_CAP, ConvError, deflated_zip, office_document, open_zip, parse_xml, read_part,
                     rels_targets)
 from .rtfconv import _FOLD, _SKIP_DESTS, _TOKEN, MAX_DEPTH, WP_CHARSET
@@ -54,6 +66,13 @@ WP_PARA_MAX = 1000                      # WP paragraph buffer is 1024 chars
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W = "{%s}" % W
+R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+_R, _A = "{%s}" % R, "{%s}" % A
+_V = "{urn:schemas-microsoft-com:vml}"
+_O = "{urn:schemas-microsoft-com:office:office}"
 
 # ====================================================================== RTF -> DOCX
 
@@ -69,6 +88,7 @@ class _Para:
     row: list | None = None                       # a table row: cells, each a list of paragraphs (runs)
     cellx: list = field(default_factory=list)     # right edge of every cell (twips)
     header: bool = False                          # \trhdr
+    pic: bytes | None = None                      # a {\*\xwpbmx} picture block (BMX bytes; b"" = bad hex)
 
 
 # run props: (b, i, u, font, cf, highlight, fs)
@@ -99,6 +119,8 @@ def _parse_rtf(data: bytes):
     cell_paras: list = []
     row_cellx: list[int] = []
     row_hdr = False
+    bmx_hex: list[bytes] = []                     # hex digits of the {\*\xwpbmx} group being read
+    bmx_depth = 0
 
     def add(text: str):
         if not text:
@@ -140,6 +162,15 @@ def _parse_rtf(data: bytes):
             star = False
             continue
         if brace == b"}":
+            if dest == "xwpbmx" and len(stack) == bmx_depth:      # a picture block between paragraphs
+                if pp.runs:
+                    finish()
+                try:
+                    pic = bytes.fromhex(b"".join(bmx_hex).decode("ascii"))
+                except ValueError:
+                    pic = b""
+                paras.append(_Para(pic=pic))
+                bmx_hex = []
             if stack:
                 props, dest, uc = stack.pop()
             star = False
@@ -182,7 +213,12 @@ def _parse_rtf(data: bytes):
                 star = False
                 if w == "xwp" and n is not None and dest is None:
                     pp.xwp = n
+                if w == "xwpbmx" and dest is None and not in_row:
+                    dest, bmx_hex, bmx_depth = "xwpbmx", [], len(stack)
+                    continue
                 dest = "skip"
+                continue
+            if dest == "xwpbmx":
                 continue
             if w in ("fonttbl", "colortbl"):
                 dest = w
@@ -278,6 +314,10 @@ def _parse_rtf(data: bytes):
                 page[w] = n
             continue
         if text is not None:
+            if dest == "xwpbmx":
+                if len(stack) == bmx_depth:
+                    bmx_hex.append(text)
+                continue
             if dest == "colortbl":
                 for _ in range(text.count(b";")):
                     colors.append((comps.get("red", 0), comps.get("green", 0), comps.get("blue", 0))
@@ -454,6 +494,26 @@ def _table_xml(rows: list, fonts, colors, deff) -> str:
     return "".join(out)
 
 
+_REL_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+
+def _picture_xml(k: int, pw: int, ph: int) -> str:
+    """a centered paragraph holding inline picture k (word/media/imageK.png, relationship rId(K+2)),
+    sized by the size rule shared with X16 Write"""
+    cx, cy = bmx.display_emu(pw, ph)
+    return ('<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>'
+            '<wp:inline distT="0" distB="0" distL="0" distR="0">'
+            f'<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>'
+            f'<wp:docPr id="{k}" name="Picture {k}"/>'
+            '<wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
+            f'<a:graphic><a:graphicData uri="{PIC}"><pic:pic>'
+            f'<pic:nvPicPr><pic:cNvPr id="{k}" name="image{k}.png"/><pic:cNvPicPr/></pic:nvPicPr>'
+            f'<pic:blipFill><a:blip r:embed="rId{k + 2}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
+            f'<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
+            '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>')
+
+
 def wp_rtf_to_docx(data: bytes) -> bytes:
     paras, fonts, colors, page, deff = _parse_rtf(data)
     wp = any(p.xwp is not None for p in paras)
@@ -464,9 +524,12 @@ def wp_rtf_to_docx(data: bytes) -> bytes:
         if p.row is not None:
             out.append({"row": p})
             continue
+        if p.pic is not None:
+            out.append({"pic": p.pic})
+            continue
         v = p.xwp
         if wp and v is not None:
-            if v & 128 and out and "row" not in out[-1]:
+            if v & 128 and out and "runs" in out[-1]:
                 prev = out[-1]
                 txt = "".join(t for _, t in prev["runs"])
                 if txt and not txt.endswith(" ") and prev["runs"]:
@@ -497,7 +560,16 @@ def wp_rtf_to_docx(data: bytes) -> bytes:
                         "pagebb": p.pagebb})
     body = []
     rows: list = []
+    media: list[tuple[str, bytes]] = []
     for i, d in enumerate(out):
+        if "pic" in d:
+            try:
+                png, pw, ph = bmx.bmx_to_png(d["pic"])
+            except ConvError:
+                continue                                    # a bad picture is dropped, not the save
+            media.append((f"media/image{len(media) + 1}.png", png))
+            body.append(_picture_xml(len(media), pw, ph))
+            continue
         if "row" in d:
             if rows and d["row"].header:
                 body.append(_table_xml(rows, fonts, colors, deff) + "<w:p/>")
@@ -529,17 +601,24 @@ def wp_rtf_to_docx(data: bytes) -> bytes:
             f'w:right="{page.get("margr", 1440)}" w:bottom="{page.get("margb", 1080)}" '
             f'w:left="{page.get("margl", 1440)}" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>')
     doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
-           f'<w:document xmlns:w="{W}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+           f'<w:document xmlns:w="{W}" xmlns:r="{R}" xmlns:wp="{WP}" xmlns:a="{A}" xmlns:pic="{PIC}">'
            "<w:body>" + "".join(body) + sect + "</w:body></w:document>")
+    ct, rels = _CT_DOCX, _DOC_RELS
+    if media:
+        ct = ct.replace('<Default Extension="xml"', '<Default Extension="png" ContentType="image/png"/>'
+                        '<Default Extension="xml"')
+        rels = rels.replace("</Relationships>", "".join(
+            f'<Relationship Id="rId{k + 3}" Type="{_REL_IMAGE}" Target="{name}"/>'
+            for k, (name, _) in enumerate(media)) + "</Relationships>")
     return deflated_zip([
-        ("[Content_Types].xml", _CT_DOCX.encode()),
+        ("[Content_Types].xml", ct.encode()),
         ("_rels/.rels", _RELS_DOCX.encode()),
         ("docProps/app.xml", _APP.encode()),
         ("word/document.xml", doc.encode("utf-8")),
         ("word/styles.xml", _styles_xml(fonts.get(deff, "Courier New")).encode("utf-8")),
         ("word/numbering.xml", _numbering_xml(numbered).encode("utf-8")),
-        ("word/_rels/document.xml.rels", _DOC_RELS.encode()),
-    ])
+        ("word/_rels/document.xml.rels", rels.encode()),
+    ] + [("word/" + name, png) for name, png in media])
 
 
 # ====================================================================== DOCX -> RTF
@@ -762,11 +841,50 @@ class _OutPara:
     segs: list = field(default_factory=list)          # (props dict, text)
     cells: list | None = None                         # a table row: one segs list per cell
     header: bool = False
+    pic: bytes | None = None                          # a picture block (BMX)
+    cont: bool = False                                # the text after a picture (dropped if it stays empty)
+
+
+MAX_PICTURES = 256                                    # pictures looked at per document
+MEDIA_CAP = 16 << 20                                  # one image part
+
+
+class _Images:
+    """rId -> BMX for the X16, within the document's BMX byte budget"""
+
+    def __init__(self, zf, rels: dict):
+        self.zf, self.rels = zf, rels
+        self.total, self.tried, self.full = 0, 0, False
+        self.cache: dict[str, bytes | None] = {}
+        self.lossy = False
+
+    def get(self, rid: str | None) -> bytes | None:
+        rel = self.rels.get(rid or "")
+        if rel is None or rel[0] != "image" or self.full or self.tried >= MAX_PICTURES:
+            self.lossy = True
+            return None
+        tgt = rel[1]
+        if tgt not in self.cache:
+            self.tried += 1
+            try:
+                data = read_part(self.zf, tgt, MEDIA_CAP)
+                self.cache[tgt] = bmx.picture_to_bmx(data) if data else None
+            except ConvError:
+                self.cache[tgt] = None
+        out = self.cache[tgt]
+        if out is None:
+            self.lossy = True
+            return None
+        if self.total + len(out) > bmx.DOC_BUDGET:     # the X16's picture memory: drop the rest
+            self.full, self.lossy = True, True
+            return None
+        self.total += len(out)
+        return out
 
 
 class _DocxReader:
-    def __init__(self, styles: _Styles, numbering: _Numbering):
-        self.styles, self.num = styles, numbering
+    def __init__(self, styles: _Styles, numbering: _Numbering, images: _Images | None = None):
+        self.styles, self.num, self.images = styles, numbering, images
         self.paras: list[_OutPara] = []
         self.lossy = False
 
@@ -850,9 +968,14 @@ class _DocxReader:
         self.paras.append(out)
         self.fld: list[str] = []
         self.inline(p, rbase, 0)
+        if self.cur.cont and not self.cur.segs and self.paras and self.paras[-1] is self.cur:
+            self.paras.pop()                          # nothing followed the picture
 
     def _break(self, page: bool):
         cur = self.cur
+        if cur.cont and not cur.segs:                 # a break right after a picture: the picture ended the line
+            cur.cont, cur.pagebb = False, cur.pagebb or page
+            return
         nxt = _OutPara(level=cur.level, align=cur.align, pagebb=page)
         self.paras.append(nxt)
         self.cur = nxt
@@ -915,9 +1038,48 @@ class _DocxReader:
             elif tag == _W + "sym":
                 self.cur.segs.append((props, "?"))
                 self.lossy = True
-            elif tag in (_W + "drawing", _W + "pict", _W + "object", _W + "footnoteReference",
-                         _W + "endnoteReference") or tag.endswith("}AlternateContent"):
+            elif tag == _W + "drawing" or tag in (_W + "pict", _W + "object") or tag.endswith("}AlternateContent"):
+                self.pictures(ch)
+            elif tag in (_W + "footnoteReference", _W + "endnoteReference"):
                 self.lossy = True
+
+    # ---- pictures: each one becomes its own block, splitting the paragraph around it
+    @staticmethod
+    def _image_refs(el) -> list[str | None]:
+        out: list[str | None] = []
+        for e in el.iter():
+            if e.tag == _A + "blip":
+                out.append(e.get(_R + "embed"))
+            elif e.tag == _V + "imagedata":
+                out.append(e.get(_R + "id") or e.get(_O + "relid"))
+        return out
+
+    def pictures(self, el):
+        if el.tag.endswith("}AlternateContent"):          # mc:Choice (DrawingML) or mc:Fallback (VML)
+            for branch in el:
+                refs = self._image_refs(branch)
+                if refs:
+                    break
+            else:
+                refs = []
+        else:
+            refs = self._image_refs(el)
+        if not refs or self.images is None:               # charts, shapes, text boxes; pictures in tables
+            self.lossy = True
+            return
+        for rid in refs:
+            pic = self.images.get(rid)
+            if pic is not None:
+                self.picture(pic)
+
+    def picture(self, pic: bytes):
+        cur = self.cur
+        if not cur.segs and not cur.pagebb and self.paras and self.paras[-1] is cur:
+            self.paras.pop()                          # nothing before the picture
+        self.paras.append(_OutPara(pic=pic))
+        nxt = _OutPara(level=cur.level, align=cur.align, cont=True)
+        self.paras.append(nxt)
+        self.cur = nxt
 
 
 _HEADER_WP = (
@@ -1038,12 +1200,16 @@ def docx_to_rtf(data: bytes) -> tuple[bytes, bool]:
         elif typ == "numbering":
             nb = read_part(zf, tgt)
             num_root = parse_xml(nb, "numbering") if nb else None
-    rd = _DocxReader(_Styles(styles_root), _Numbering(num_root))
+    images = _Images(zf, rels)
+    rd = _DocxReader(_Styles(styles_root), _Numbering(num_root), images)
     rd.block(body)
     paras, lossy = _split_long(rd.paras)
-    lossy |= rd.lossy
+    lossy |= rd.lossy | images.lossy
     out = bytearray(_HEADER_WP.encode("ascii"))
     for p in paras:
+        if p.pic is not None:
+            out += bmx.rtf_group(p.pic) + b"\r\n"
+            continue
         if p.cells is not None:
             n = len(p.cells)
             cw = 63 // n                                # the WP's cell: cw - 1 characters + a border

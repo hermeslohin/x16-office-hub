@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from . import frame as F
 from .frame import Reader, pstr
-from . import docxconv, sheetconv
+from . import docxconv, rtfpict, sheetconv
 from .ooxml import ConvError
 from .rtfconv import WP_CHARSET, decode_utf8, rtf_to_text, text_to_rtf, to_wire_text
 
@@ -32,7 +32,8 @@ _BAD_CHARS = set('\\:*?"<>|')
 
 T_OTHER, T_RTF, T_TXT, T_DOCX, T_XLSX, T_CSV = 0, 1, 2, 3, 4, 5
 T_DIR = 6                       # DIR entries only: a folder
-_EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": T_CSV}
+T_BMX = 7                       # an X16 bitmap picture (X16 Write inserts it); raw transfers (conv 3) only
+_EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": T_CSV, ".bmx": T_BMX}
 # conv 0 = native bytes, 1 = RTF on the X16 side, 2 = X16 sheet (simple XLSX) on the X16 side,
 # 3 = raw: byte-for-byte, any file type (file manager copies)
 CONV_RAW = 3
@@ -66,7 +67,7 @@ def check_conv(t: int, conv: int) -> None:
         raise DocError(F.E_BAD_ARG, "bad conv")
     if conv == CONV_RAW:
         return
-    if t == T_OTHER:
+    if t not in CONV_OK:
         raise DocError(F.E_UNSUPPORTED, "file type not supported")
     if conv not in CONV_OK[t]:
         raise DocError(F.E_UNSUPPORTED, "conversion not available for this file type")
@@ -86,7 +87,7 @@ def check_name(name: str, *, for_save: bool = False) -> str:
             o = ord(ch)
             if o < 0x20 or 0x7F <= o <= 0x9F or ch in _BAD_CHARS:
                 raise DocError(F.E_BAD_NAME, "name has a forbidden character")
-    if for_save and file_type(name) == T_OTHER:
+    if for_save and file_type(name) not in CONV_OK:
         raise DocError(F.E_BAD_NAME, "name must end in .rtf .txt .docx .xlsx or .csv")
     return "/".join(segs)
 
@@ -377,6 +378,8 @@ class DocsChannel:
             data, lossy = to_wire_text(decode_utf8(data))
         elif t == T_TXT:
             data, lossy = text_to_rtf(decode_utf8(data))
+        elif t == T_RTF and conv == 1:                  # pictures Word added -> X16 Write's BMX groups
+            data, lossy = await _convert(rtfpict.for_x16, data)
         elif conv and t in (T_DOCX, T_XLSX, T_CSV):
             fn = {T_DOCX: docxconv.docx_to_rtf, T_XLSX: sheetconv.xlsx_to_simple, T_CSV: sheetconv.csv_to_simple}[t]
             try:
@@ -457,6 +460,8 @@ class DocsChannel:
                 data = rtf_to_text(data, WP_CHARSET).encode("utf-8")
             elif t == T_DOCX and conv == 1:
                 data = await _convert(docxconv.wp_rtf_to_docx, data)
+            elif t == T_RTF and conv == 1:              # a PNG copy of every BMX picture, for Word
+                data = await _convert(rtfpict.add_png, data, MAX_FILE)
             elif t == T_XLSX and conv == 2:
                 data = await _convert(sheetconv.simple_to_xlsx, data)
             elif t == T_CSV:

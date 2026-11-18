@@ -216,11 +216,14 @@ is `ERR BAD_NAME`.
 **Folder paths** (DIR, MKDIR, DELETE, MOVE, COPY) follow the same rules; the empty
 path means `Documents/` itself and is only accepted by DIR.
 
-**Types:** `1` = RTF (`.rtf`, the WP's native format, passed through
-byte-for-byte), `2` = text (`.txt`: UTF-8 on ownCloud, ISO-8859-15 on the wire;
+**Types:** `1` = RTF (`.rtf`, the WP's native format; with `conv 1` only pictures are touched,
+see below, otherwise byte-for-byte), `2` = text (`.txt`: UTF-8 on ownCloud, ISO-8859-15 on the wire;
 characters with no ISO-8859-15 form become `?`), `3` = Word (`.docx`),
 `4` = Excel (`.xlsx`), `5` = CSV (`.csv`, UTF-8 on ownCloud), `0` = other
-(listed; only `conv 3` can open or save it), `6` = folder (DIR entries only).
+(listed; only `conv 3` can open or save it), `6` = folder (DIR entries only),
+`7` = BMX picture (`.bmx`, the X16 bitmap format X16 Write inserts; not flagged unsupported,
+transferred with `conv 3` only: conv 0/1/2 are refused like for type 0, and a conv 0/1/2 SAVE
+name may not end in `.bmx`).
 
 **conv** (OPEN and SAVE) says what the X16 side holds:
 
@@ -245,6 +248,19 @@ Conversions (hub module in brackets):
   fonts, text/highlight colours, alignment, indent, page breaks, tables → `w:tbl` with borders,
   the `\cellx` widths and `\trhdr` as a repeating header row). `.txt` SAVE writes a table row as
   one line, cells separated by tabs.
+  Pictures: in X16 Write's RTF a picture is a top-level `{\*\xwpbmx HEX}` group between paragraphs
+  (HEX = the BMX file, CRLF every 128 hex digits). SAVE → a centered paragraph with an inline PNG
+  (the BMX's resolution; size = w·f/80 × h·f/80 inches, f = min(1, 496/w, 640/h)); a BMX that
+  doesn't parse is dropped. OPEN: PNG/JPEG/GIF/BMP pictures → BMX v1 8 bpp (scaled down to fit
+  320 × 240, ≤ 256 colours of the 12-bit palette, transparent → white) at their place, a picture
+  inside a paragraph splitting it; EMF/WMF, pictures in tables and everything past 160,000 BMX
+  bytes per document are dropped (LOSSY). [`bmx`, needs Pillow]
+* `.rtf` conv 1 [`rtfpict`]: SAVE adds, after each `{\*\xwpbmx}` group, a paragraph Word shows:
+  `\pard\plain\qc{\*\xwppng}{\pict\pngblip\picwW\pichH\picwgoalTW\pichgoalTH HEX}\par`
+  (X16 Write's reader skips it). OPEN removes those `{\*\xwppng}` paragraphs again (an X16 RTF
+  round-trips byte-for-byte) and turns `\pngblip`/`\jpegblip` pictures that have no xwpbmx group
+  (the file was edited in Word) into xwpbmx groups, same rules and budget as `.docx` (LOSSY if a
+  picture is dropped). Everything else is passed through unchanged.
 * `.xlsx` conv 2 [`sheetconv`]: OPEN → simple XLSX (first sheet; shared strings,
   styles mapped to the 32-entry table, booleans → 1/0, shared formulas expanded,
   X16 limits applied: 256 columns, 9999 rows, 6000 cells, 50-byte texts (cut),
@@ -264,7 +280,7 @@ rep : total u16, start u16, n u8, n × entry
 entry: type u8, flags u8, size u32, mtime u32 (unix UTC),
        year-2000 u8, month u8, day u8, hour u8, min u8   (local, America/New_York),
        name str
-flags: bit0 unsupported (type 0, name too long or not encodable),
+flags: bit0 unsupported (type 0, name too long or not encodable; never for type 7 `.bmx` alone),
        bit1 name shown lossy (non ISO-8859-15 chars replaced with '?'),
        bit2 file larger than the 1 MiB limit
 ```

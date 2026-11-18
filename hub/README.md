@@ -6,7 +6,7 @@ UART/Zimodem link) and the suite's **ownCloud Server 11 (Classic)** at
 
 | Data | Protocol | Where on ownCloud |
 |---|---|---|
-| Word-processor docs, sheets (`.rtf .txt .docx .xlsx .csv`), any file from X16 Files (raw, folders too) | WebDAV | `/remote.php/dav/files/x16hub/Documents/` (created if missing) |
+| Word-processor docs, sheets (`.rtf .txt .docx .xlsx .csv`), pictures (`.bmx`, raw), any file from X16 Files (raw, folders too) | WebDAV | `/remote.php/dav/files/x16hub/Documents/` (created if missing) |
 | Calendar | CalDAV | `/remote.php/dav/calendars/x16hub/x16/` (calendar "X16", created if missing) |
 
 The X16s reach the hub over **X16Link** (`python -m x16hub serve`, TCP port 6502, protocol in
@@ -15,7 +15,8 @@ The X16s reach the hub over **X16Link** (`python -m x16hub serve`, TCP port 6502
 Code: `x16hub/backend/owncloud.py` (client), `x16hub/selftest.py` (`oc check`),
 `x16hub/__main__.py` (CLI), `x16hub/link/` (X16Link server: `server.py` sessions/auth/limits,
 `frame.py`, `keys.py` PSKs + config, `docs.py` docs channel, `cal.py` calendar channel,
-`rtfconv.py` txt<->RTF, `docxconv.py` X16 Write RTF<->DOCX, `sheetconv.py` X16 Sheets simple
+`rtfconv.py` txt<->RTF, `docxconv.py` X16 Write RTF<->DOCX (pictures too), `bmx.py` X16 BMX
+pictures <-> Pillow (needs Pillow), `rtfpict.py` PNG copies of BMX pictures in `.rtf` files, `sheetconv.py` X16 Sheets simple
 XLSX<->XLSX/CSV, `ooxml.py` shared zip-bomb/XML guards), `x16hub/calsync.py` (calendar sync engine). The old Google OAuth code is parked, unused, in
 `x16hub/_shelved_google/`.
 
