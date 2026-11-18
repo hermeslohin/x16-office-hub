@@ -40,6 +40,7 @@ RUN python -m pytest -q -p no:cacheprovider
 FROM base AS runtime
 
 LABEL org.opencontainers.image.title="x16hub" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
       org.opencontainers.image.description="X16 Office sync hub: X16Link server for Commander X16 apps, syncing with ownCloud" \
       org.opencontainers.image.source="https://github.com/hermeslohin/x16-office-hub"
 

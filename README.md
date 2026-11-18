@@ -45,3 +45,13 @@ and connecting the X16. `compose.yaml` is the ready-made Compose file.
 cd hub && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 .venv/bin/python -m pytest -q              # unit, fuzz and security-regression tests (no network)
 ```
+
+## License
+
+Copyright (C) 2026 hermeslohin
+
+The sync hub and the X16Link library is free software: you can redistribute it and/or modify it under the terms of the GNU General
+Public License as published by the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See [LICENSE](LICENSE) for the full text of the GNU General Public License v3.
