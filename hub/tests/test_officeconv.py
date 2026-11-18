@@ -480,3 +480,34 @@ def test_formula_limit_matches_x16():
     sh, _ = S.read_sheet(data)
     assert lossy and sh.cells[(1, 1)].f is None and sh.cells[(1, 1)].v == 2.0
     assert sh.cells[(1, 2)].f == ok_f
+
+
+# ---------------------------------------------------------------- memory-amplification guards
+
+
+def _docx_with_body(body: bytes) -> bytes:
+    from x16hub.link.ooxml import deflated_zip
+    w = b'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    doc = b"<w:document " + w + b"><w:body>" + body + b"</w:body></w:document>"
+    return deflated_zip([("word/document.xml", doc)])
+
+
+def test_docx_element_bomb_is_refused_before_parsing():
+    # ~50 KB deflated, 32 MiB of empty paragraphs: used to need ~2 GB of RAM.
+    data = _docx_with_body(b"<w:p/>" * 5_500_000)
+    assert len(data) < 100_000
+    with pytest.raises(ConvError, match="too many elements"):
+        D.docx_to_rtf(data)
+
+
+def test_sparse_sheet_cannot_balloon_into_huge_csv():
+    # Cells on many rows in column XFD: a ~100 KB upload used to pad out to ~33 MB of commas
+    # (a 1 MiB one to ~1 GB, past the unit's MemoryMax).
+    sh = S.Sheet()
+    for r in range(1, 2001):
+        sh.cells[(r, 16384)] = S.Cell(1.0, "n")
+    with pytest.raises(ConvError, match="larger than 1 MiB"):
+        S.simple_to_csv(S.write_simple(sh))
+    small = S.Sheet()
+    small.cells[(1, 300)] = S.Cell(1.0, "n")
+    assert S.simple_to_csv(S.write_simple(small)).count(b",") == 299

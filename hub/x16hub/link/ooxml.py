@@ -28,6 +28,11 @@ MAX_ENTRIES = 2000              # entries in one archive
 MAX_TOTAL = 96 << 20            # sum of declared uncompressed sizes
 PART_CAP = 32 << 20             # one big part (sheet / document / sharedStrings)
 SMALL_CAP = 4 << 20             # rels, workbook, styles, numbering, ...
+# Markup cap per parsed part ('<' count bounds the element count). ElementTree costs ~350 bytes
+# per element, so a 32 MiB part of empty elements (a ~50 KB deflated file) needed ~2 GB while
+# the hub runs under MemoryMax=512M. 400k tags is ~20k Word paragraphs / ~100k cells, far
+# beyond what X16 Write/Sheets hold, and parses in ~150 MB worst case.
+MAX_XML_TAGS = 400_000
 
 
 def open_zip(data: bytes) -> zipfile.ZipFile:
@@ -73,6 +78,8 @@ def read_part(zf: zipfile.ZipFile, name: str, cap: int = SMALL_CAP) -> bytes | N
 
 
 def parse_xml(b: bytes, what: str = "XML"):
+    if b.count(b"<") > MAX_XML_TAGS:           # before parsing: every element needs a '<'
+        raise ConvError(f"{what} has too many elements to convert")
     try:
         return _safe_fromstring(b)
     except (ParseError, DefusedXmlException, ValueError, SyntaxError):

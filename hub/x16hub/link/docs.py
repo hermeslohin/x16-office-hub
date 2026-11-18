@@ -35,6 +35,15 @@ _EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": 
 CONV_OK = {T_RTF: (0, 1), T_TXT: (0, 1), T_DOCX: (0, 1), T_XLSX: (0, 2), T_CSV: (0, 2)}
 FL_UNSUPPORTED, FL_LOSSY, FL_TOO_LARGE = 1, 2, 4
 
+# One format conversion at a time across all sessions: each is bounded in memory
+# (ooxml caps), and serializing keeps the sum under the unit's MemoryMax.
+_CONV_LOCK = asyncio.Semaphore(1)
+
+
+async def _convert(fn, *a):
+    async with _CONV_LOCK:
+        return await asyncio.to_thread(fn, *a)
+
 
 class DocError(Exception):
     def __init__(self, code: int, msg: str, extra: bytes = b""):
@@ -262,7 +271,7 @@ class DocsChannel:
         elif conv and t in (T_DOCX, T_XLSX, T_CSV):
             fn = {T_DOCX: docxconv.docx_to_rtf, T_XLSX: sheetconv.xlsx_to_simple, T_CSV: sheetconv.csv_to_simple}[t]
             try:
-                data, lossy = await asyncio.to_thread(fn, data)
+                data, lossy = await _convert(fn, data)
             except (ConvError, RecursionError) as e:
                 msg = str(e) if isinstance(e, ConvError) else "file is nested too deeply"
                 raise DocError(F.E_UNSUPPORTED, f"cannot convert: {msg}"[:120]) from None
@@ -335,11 +344,11 @@ class DocsChannel:
             elif t == T_TXT:
                 data = rtf_to_text(data, WP_CHARSET).encode("utf-8")
             elif t == T_DOCX and conv == 1:
-                data = await asyncio.to_thread(docxconv.wp_rtf_to_docx, data)
+                data = await _convert(docxconv.wp_rtf_to_docx, data)
             elif t == T_XLSX and conv == 2:
-                data = await asyncio.to_thread(sheetconv.simple_to_xlsx, data)
+                data = await _convert(sheetconv.simple_to_xlsx, data)
             elif t == T_CSV:
-                data = await asyncio.to_thread(sheetconv.simple_to_csv, data)
+                data = await _convert(sheetconv.simple_to_csv, data)
         except (ValueError, RecursionError) as e:          # ConvError is a ValueError
             self.pending.drop(self.device, s["size"], s["crc"])     # retrying can't help
             self.save = None

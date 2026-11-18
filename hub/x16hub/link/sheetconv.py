@@ -633,7 +633,10 @@ def csv_to_simple(data: bytes) -> tuple[bytes, bool]:
     return write_simple(sh), lossy
 
 
-def simple_to_csv(data: bytes) -> bytes:
+MAX_CSV_OUT = 1 << 20           # = docs.MAX_FILE; enforced while writing (sparse sheets pad to huge CSVs)
+
+
+def simple_to_csv(data: bytes, max_out: int = MAX_CSV_OUT) -> bytes:
     sh, _ = read_sheet(data, limits=False)
     rows: dict[int, dict[int, str]] = {}
     for (r, c), cell in sh.cells.items():
@@ -648,5 +651,13 @@ def simple_to_csv(data: bytes) -> bytes:
     w = csv.writer(buf, lineterminator="\r\n")
     for r in range(1, (max(rows) if rows else 0) + 1):
         cs = rows.get(r, {})
-        w.writerow([cs.get(c, "") for c in range(1, (max(cs) if cs else 0) + 1)])
-    return buf.getvalue().encode("utf-8")
+        ncol = max(cs) if cs else 0
+        if ncol > max_out:                       # the separators alone would not fit
+            raise ConvError("CSV would be larger than 1 MiB")
+        w.writerow([cs.get(c, "") for c in range(1, ncol + 1)])
+        if buf.tell() > max_out:                 # chars <= UTF-8 bytes: safe early stop
+            raise ConvError("CSV would be larger than 1 MiB")
+    out = buf.getvalue().encode("utf-8")
+    if len(out) > max_out:
+        raise ConvError("CSV would be larger than 1 MiB")
+    return out
