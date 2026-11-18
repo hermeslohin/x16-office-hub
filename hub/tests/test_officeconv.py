@@ -1,5 +1,6 @@
 """Unit tests for the OOXML converters: sheetconv (X16 Sheets <-> xlsx/csv) and docxconv (X16 Write <-> docx)."""
 import io
+import pathlib
 import re
 import zipfile
 
@@ -428,9 +429,14 @@ def test_docx_to_rtf():
     assert lines[6] == "\\pard\\plain\\qr\\li1152\\fs24 before\\par"
     assert lines[7] == "\\pard\\plain\\qr\\li1152\\pagebb\\fs24 after\\tab tab\\par"
     assert lines[8] == "\\pard\\plain\\ql\\li0\\pagebb\\fs24 pb\\par"
-    assert lines[9:11] == ["\\pard\\plain\\ql\\li0\\fs24 a    b\\par", "\\pard\\plain\\ql\\li0\\fs24 c    d\\par"]
+    # the table: two X16 Write table rows, the first a header, 2 columns of 31 cells (31 * 144 twips)
+    assert lines[9].startswith("\\trowd\\trgaph72\\trleft0\\trhdr\\clbrdrt") and lines[9].endswith("\\cellx8928")
+    assert lines[10:13] == ["\\pard\\plain\\intbl\\sb0\\sa0\\sl-240\\slmult0\\ql\\fs24 a\\cell",
+                            "\\pard\\plain\\intbl\\sb0\\sa0\\sl-240\\slmult0\\ql\\fs24 b\\cell", "\\row"]
+    assert "\\trhdr" not in lines[13] and lines[14].endswith(" c\\cell") and lines[15].endswith(" d\\cell")
     text = rtf_to_text(rtf, WP_CHARSET)
     assert text.splitlines()[:3] == ['Heading "One"', "plain red hl bi x {\\} € ? --link7", "●   bullet"]
+    assert text.splitlines()[-2:] == ["a\tb", "c\td"]
 
 
 def test_docx_wp_roundtrip_and_long_paragraph():
@@ -444,6 +450,70 @@ def test_docx_wp_roundtrip_and_long_paragraph():
     rtf, lossy = D.docx_to_rtf(long)
     body = [ln for ln in rtf.split(b"\r\n") if ln.startswith(b"\\pard")]
     assert lossy and len(body) == 3 and all(len(ln) < 1100 for ln in body)
+
+
+# ====================================================================== tables
+
+WP_TABLE = (pathlib.Path(__file__).parent / "fixtures" / "wp_table.rtf").read_bytes()  # from X16 Write's tabletest
+
+
+def test_wp_table_to_docx():
+    root, _ = doc_xml(D.wp_rtf_to_docx(WP_TABLE))
+    body = root.find(_w("body"))
+    kids = [c.tag.split("}")[1] for c in body]
+    assert kids == ["p", "tbl", "p", "sectPr"]
+    tbl = body.find(_w("tbl"))
+    assert [g.get(_w("w")) for g in tbl.find(_w("tblGrid"))] == ["2160"] * 4
+    assert tbl.find(f"{_w('tblPr')}/{_w('tblBorders')}/{_w('insideV')}").get(_w("val")) == "single"
+    rows = tbl.findall(_w("tr"))
+    assert len(rows) == 4
+    assert rows[0].find(f"{_w('trPr')}/{_w('tblHeader')}") is not None
+    assert rows[1].find(_w("trPr")) is None
+    cells = [["".join(t.text or "" for t in tc.iter(_w("t"))) for tc in tr.findall(_w("tc"))] for tr in rows]
+    assert cells[0] == ["Item", "Qty", "Price", "Note"]
+    assert cells[1][0] == "Pie" and cells[2][:2] == ["Lemonade", "6"] and cells[3][1] == "ABCDEFGHIJKLMN"
+    texts = [t for t, _, _ in paras_of(root)]
+    assert texts[0] == "Before the table" and texts[-1] == "After the table"
+
+
+def test_wp_table_roundtrip_and_text():
+    back, lossy = D.docx_to_rtf(D.wp_rtf_to_docx(WP_TABLE))
+    assert not lossy
+    s = back.decode("latin-1")
+    assert s.count("\\trowd") == 4 and s.count("\\row\r\n") == 4 and s.count("\\cell\r\n") == 16
+    assert s.count("\\trhdr") == 1 and s.count("\\cellx2160") == 4
+    lines = rtf_to_text(back, WP_CHARSET).splitlines()
+    assert lines[0] == "Before the table" and lines[1] == "Item\tQty\tPrice\tNote"
+    assert lines[3].startswith("Lemonade\t6") and lines[-1] == "After the table"
+    assert rtf_to_text(WP_TABLE, WP_CHARSET).splitlines()[1] == "Item\tQty\tPrice\tNote"
+
+
+def test_docx_table_limits():
+    tc = lambda t: f"<w:tc><w:p>{r(t)}</w:p></w:tc>"
+    wide = "<w:tbl><w:tr>" + "".join(tc(str(i)) for i in range(10)) + "</w:tr></w:tbl>"
+    nested = ("<w:tbl><w:tr><w:tc><w:p>" + r("out") + "</w:p><w:tbl><w:tr>" + tc("in") +
+              "</w:tr></w:tbl></w:tc></w:tr></w:tbl>")
+    rtf, lossy = D.docx_to_rtf(make_docx(wide + nested + wide))
+    s = rtf.decode("latin-1")
+    assert lossy
+    rows = [ln for ln in s.split("\r\n") if ln.startswith("\\trowd")]
+    assert len(rows) == 3 and rows[0].count("\\cellx") == 8 and rows[0].endswith("\\cellx8064")
+    assert "7 8 9\\cell" in s and "out in\\cell" in s
+    assert "\\pard\\plain\\ql\\li0\\fs24 \\par" in s                # an empty paragraph keeps tables apart
+
+
+def test_generic_rtf_table_to_docx():
+    # Word-style: row properties repeated at the end of the row, two paragraphs in a cell, no \trhdr
+    rtf = (b"{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}\\pard Intro\\par"
+           b"\\trowd\\cellx3000\\cellx6000\\pard\\intbl one\\par two\\cell\\pard\\intbl \\b x\\b0\\cell"
+           b"{\\trowd\\cellx3000\\cellx6000\\row}\\pard End\\par}")
+    root, _ = doc_xml(D.wp_rtf_to_docx(rtf))
+    tbl = root.find(f"{_w('body')}/{_w('tbl')}")
+    assert [g.get(_w("w")) for g in tbl.find(_w("tblGrid"))] == ["3000", "3000"]
+    tcs = tbl.find(_w("tr")).findall(_w("tc"))
+    assert [["".join(t.text or "" for t in p.iter(_w("t"))) for p in tc.findall(_w("p"))] for tc in tcs] == \
+        [["one", "two"], ["x"]]
+    assert [t for t, _, _ in paras_of(root)][0] == "Intro" and [t for t, _, _ in paras_of(root)][-1] == "End"
 
 
 def test_docx_hostile_inputs():

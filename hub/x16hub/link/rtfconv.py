@@ -144,6 +144,13 @@ def rtf_to_text(data: bytes, charset: str | None = None) -> str:
                 cur_soft = False
             elif word == b"tab":
                 cur.append("\t")
+            elif word == b"cell":                       # table: cells separated by tabs, a row per line
+                cur.append("\t")
+            elif word == b"row":
+                while cur and cur[-1] == "\t":
+                    cur.pop()
+                paras.append((False, cur))
+                cur, cur_soft = [], False
             elif word == b"uc" and num is not None:
                 uc = max(0, min(int(num), 4))
             elif word == b"u" and num is not None:

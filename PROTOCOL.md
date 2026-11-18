@@ -237,10 +237,13 @@ Conversions (hub module in brackets):
 
 * `.docx` conv 1 [`docxconv`]: OPEN → RTF in the WP dialect (WP fonttbl, the WP's
   16-colour colortbl, `\b \i \ul \fN \cfN \highlightN`, `\qc/\qr`, `\li` = level × 576,
-  `\pagebb` for page breaks, list markers as text, table rows as one paragraph
-  with cells 4 spaces apart, no `{\*\xwp}` tags so the WP re-wraps). SAVE: WP RTF →
-  DOCX (soft-wrapped lines rejoined, list markers → real Word lists, fonts,
-  text/highlight colours, alignment, indent, page breaks).
+  `\pagebb` for page breaks, list markers as text, tables as WP table rows
+  `\trowd`..`\cellx`..`\intbl`..`\cell`..`\row` (equal widths, first row `\trhdr`; more than 8
+  columns merged into the 8th, a cell's paragraphs joined with spaces), no `{\*\xwp}` tags so the
+  WP re-wraps). SAVE: WP RTF → DOCX (soft-wrapped lines rejoined, list markers → real Word lists,
+  fonts, text/highlight colours, alignment, indent, page breaks, tables → `w:tbl` with borders,
+  the `\cellx` widths and `\trhdr` as a repeating header row). `.txt` SAVE writes a table row as
+  one line, cells separated by tabs.
 * `.xlsx` conv 2 [`sheetconv`]: OPEN → simple XLSX (first sheet; shared strings,
   styles mapped to the 32-entry table, booleans → 1/0, shared formulas expanded,
   X16 limits applied: 256 columns, 9999 rows, 6000 cells, 50-byte texts (cut),

@@ -13,6 +13,9 @@ wp_rtf_to_docx(data) -> bytes
     Generic RTF (no xwp tags) is converted best-effort: paragraphs with
     alignment, \\li / \\fi indents, \\page / \\pagebb page breaks and the same run
     formatting; no list detection.
+    Tables (\\trowd .. \\cellx .. \\intbl .. \\cell .. \\row, as X16 Write writes them, up to
+    8 x 20) become a w:tbl with single borders, the \\cellx widths, \\trhdr as a header
+    row; a paragraph follows every table (Word needs one).
 
 docx_to_rtf(data) -> (bytes, lossy)
     Any DOCX -> RTF the WP importer reads: the WP fonttbl and 16-colour palette,
@@ -21,8 +24,11 @@ docx_to_rtf(data) -> (bytes, lossy)
     ISO-8859-15 ('?' + lossy for anything else, typographic punctuation folded).
     Lists become text markers; page breaks become \\pagebb on the following
     paragraph (the WP importer ignores \\page as a paragraph break); a manual line
-    break starts a new paragraph with the same formatting; table rows become one
-    paragraph each, cells separated by 4 spaces (lossy); images/objects/footnotes
+    break starts a new paragraph with the same formatting; tables become X16 Write
+    tables (\\trowd .. \\cell .. \\row with equal \\cellx widths, the first row \\trhdr):
+    a cell's paragraphs are joined with spaces, more than 8 columns are merged into
+    the 8th and a cell longer than the WP's cell width is cut by the WP (lossy),
+    nested tables are flattened into their cell (lossy); images/objects/footnotes
     are dropped (lossy); paragraphs longer than the WP's 1024-char buffer are split.
 """
 from __future__ import annotations
@@ -59,6 +65,9 @@ class _Para:
     fi: int = 0
     pagebb: bool = False
     xwp: int | None = None
+    row: list | None = None                       # a table row: cells, each a list of paragraphs (runs)
+    cellx: list = field(default_factory=list)     # right edge of every cell (twips)
+    header: bool = False                          # \trhdr
 
 
 # run props: (b, i, u, font, cf, highlight, fs)
@@ -84,6 +93,11 @@ def _parse_rtf(data: bytes):
     font_cur, font_name = None, []
     comps: dict[str, int] = {}
     pending_page = False
+    in_row, cellx_done = False, False             # table row being read; its \cellx list is complete
+    row_cells: list = []
+    cell_paras: list = []
+    row_cellx: list[int] = []
+    row_hdr = False
 
     def add(text: str):
         if not text:
@@ -96,6 +110,10 @@ def _parse_rtf(data: bytes):
 
     def finish():
         nonlocal pp, pending_page
+        if in_row:                                # a paragraph inside a table cell
+            cell_paras.append(pp.runs)
+            pp = _Para()
+            return
         done = pp
         done.pagebb = done.pagebb or pending_page
         pending_page = False
@@ -182,7 +200,32 @@ def _parse_rtf(data: bytes):
                     comps[w] = max(0, min(255, n))
                 continue
             on = n != 0
-            if w == "par":
+            if w in ("trowd", "intbl") and not in_row:
+                if pp.runs:
+                    finish()
+                pp = _Para()
+                in_row, cellx_done, row_cells, cell_paras, row_cellx, row_hdr = True, False, [], [], [], False
+                if w == "trowd":
+                    continue
+            if w == "trowd":
+                cellx_done = cellx_done or bool(row_cells)    # Word repeats the row definition at its end
+            elif w == "cellx" and in_row and not cellx_done and n is not None:
+                row_cellx.append(n)
+            elif w == "trhdr" and in_row:
+                row_hdr = True
+            elif w == "cell" and in_row:
+                cell_paras.append(pp.runs)
+                row_cells.append(cell_paras)
+                cell_paras = []
+                pp = _Para()
+            elif w == "row" and in_row:
+                if pp.runs or cell_paras:
+                    cell_paras.append(pp.runs)
+                    row_cells.append(cell_paras)
+                paras.append(_Para(row=row_cells, cellx=row_cellx, header=row_hdr))
+                in_row, cell_paras = False, []
+                pp = _Para()
+            elif w == "par":
                 finish()
             elif w == "pard":
                 pp.align, pp.li, pp.fi, pp.pagebb, pp.xwp = "left", 0, 0, False, None
@@ -248,6 +291,12 @@ def _parse_rtf(data: bytes):
                 fontname_text(t.decode(charset, "replace"))
             elif dest is None and t:
                 add(t.decode(charset, "replace"))
+    if in_row and (row_cells or pp.runs):         # a row without its \row
+        if pp.runs:
+            cell_paras.append(pp.runs)
+            row_cells.append(cell_paras)
+        paras.append(_Para(row=row_cells, cellx=row_cellx, header=row_hdr))
+        pp = _Para()
     if pp.runs:
         finish()
     return paras, fonts, colors, page, deff
@@ -377,6 +426,33 @@ def _numbering_xml(numbered: list[tuple[int, int, int]]) -> str:
             + "".join(nums) + "</w:numbering>")
 
 
+WP_PAGE_W = 64 * 144                    # the WP's text width: 64 columns of 10 cpi, in twips
+_BORDER = '<w:{0} w:val="single" w:sz="4" w:space="0" w:color="000000"/>'
+
+
+def _table_xml(rows: list, fonts, colors, deff) -> str:
+    """rows: _Para with .row (cells -> paragraphs -> runs), .cellx, .header -> a w:tbl."""
+    n = max(1, max(len(r.row) for r in rows))
+    cx = rows[0].cellx
+    widths = [b - a for a, b in zip([0] + cx, cx)] if len(cx) == n and all(b > a for a, b in zip([0] + cx, cx)) \
+        else [WP_PAGE_W // n] * n
+    out = ['<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>',
+           "".join(_BORDER.format(s) for s in ("top", "left", "bottom", "right", "insideH", "insideV")),
+           '</w:tblBorders><w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid>',
+           "".join(f'<w:gridCol w:w="{w}"/>' for w in widths), "</w:tblGrid>"]
+    for r in rows:
+        out.append("<w:tr>" + ("<w:trPr><w:tblHeader/></w:trPr>" if r.header else ""))
+        for k in range(n):
+            cell = r.row[k] if k < len(r.row) else [[]]
+            out.append(f'<w:tc><w:tcPr><w:tcW w:w="{widths[k]}" w:type="dxa"/></w:tcPr>')
+            for runs in cell or [[]]:
+                out.append("<w:p>" + "".join(_run_xml(tuple(pr), t, fonts, colors, deff) for pr, t in runs) + "</w:p>")
+            out.append("</w:tc>")
+        out.append("</w:tr>")
+    out.append("</w:tbl>")
+    return "".join(out)
+
+
 def wp_rtf_to_docx(data: bytes) -> bytes:
     paras, fonts, colors, page, deff = _parse_rtf(data)
     wp = any(p.xwp is not None for p in paras)
@@ -384,9 +460,12 @@ def wp_rtf_to_docx(data: bytes) -> bytes:
     numbered: list[tuple[int, int, int]] = []
     num_state: dict[int, tuple[int, int]] = {}        # level -> (numId, next number)
     for p in paras:
+        if p.row is not None:
+            out.append({"row": p})
+            continue
         v = p.xwp
         if wp and v is not None:
-            if v & 128 and out:
+            if v & 128 and out and "row" not in out[-1]:
                 prev = out[-1]
                 txt = "".join(t for _, t in prev["runs"])
                 if txt and not txt.endswith(" ") and prev["runs"]:
@@ -416,7 +495,19 @@ def wp_rtf_to_docx(data: bytes) -> bytes:
             out.append({"runs": p.runs, "align": p.align, "left": max(0, p.li), "first": p.fi, "num": None,
                         "pagebb": p.pagebb})
     body = []
-    for d in out:
+    rows: list = []
+    for i, d in enumerate(out):
+        if "row" in d:
+            if rows and d["row"].header:
+                body.append(_table_xml(rows, fonts, colors, deff) + "<w:p/>")
+                rows = []
+            rows.append(d["row"])
+            if i + 1 == len(out) or "row" not in out[i + 1]:
+                body.append(_table_xml(rows, fonts, colors, deff))
+                if i + 1 == len(out):
+                    body.append("<w:p/>")
+                rows = []
+            continue
         ppr = []
         if d["pagebb"]:
             ppr.append("<w:pageBreakBefore/>")
@@ -658,6 +749,8 @@ class _OutPara:
     align: str = "left"
     pagebb: bool = False
     segs: list = field(default_factory=list)          # (props dict, text)
+    cells: list | None = None                         # a table row: one segs list per cell
+    header: bool = False
 
 
 class _DocxReader:
@@ -687,21 +780,34 @@ class _DocxReader:
                 self.lossy = True
 
     def table(self, tbl, depth):
-        self.lossy = True
-        for tr in tbl.iter(_W + "tr"):
-            out = _OutPara()
-            first = True
+        # an X16 Write table: up to 8 columns (more are merged into the 8th), a cell's paragraphs
+        # joined with spaces; nested tables are flattened into their cell
+        if self.paras and self.paras[-1].cells is not None:
+            self.paras.append(_OutPara())             # keep two tables apart
+        first_row = True
+        for tr in tbl.findall(_W + "tr"):
+            out = _OutPara(cells=[], header=first_row)
+            first_row = False
             for tc in tr.findall(_W + "tc"):
-                if not first:
-                    out.segs.append(({}, "    "))
-                first = False
+                if tc.find(".//" + _W + "tbl") is not None:
+                    self.lossy = True
                 sub = _DocxReader(self.styles, self.num)
                 for p in tc.iter(_W + "p"):
                     sub.para(p)
-                for k, sp in enumerate(sub.paras):
-                    if k and sp.segs:
-                        out.segs.append(({}, " "))
-                    out.segs.extend(sp.segs)
+                self.lossy |= sub.lossy
+                segs: list = []
+                for sp in sub.paras:
+                    if segs and sp.segs:
+                        segs.append(({}, " "))
+                    segs.extend(sp.segs)
+                if len(out.cells) == 8:
+                    self.lossy = True
+                    out.cells[7].append(({}, " "))
+                    out.cells[7].extend(segs)
+                else:
+                    out.cells.append(segs)
+            if not out.cells:
+                out.cells.append([])
             self.paras.append(out)
 
     def para(self, p):
@@ -825,6 +931,9 @@ def _font_idx(name: str | None) -> int:
 def _split_long(paras: list[_OutPara]) -> tuple[list[_OutPara], bool]:
     out, lossy = [], False
     for p in paras:
+        if p.cells is not None:
+            out.append(p)
+            continue
         while sum(len(t) for _, t in p.segs) > WP_PARA_MAX:
             lossy = True
             text = "".join(t for _, t in p.segs)
@@ -845,6 +954,54 @@ def _split_long(paras: list[_OutPara]) -> tuple[list[_OutPara], bool]:
             p = _OutPara(p.level, p.align, False, rest)
         out.append(p)
     return out, lossy
+
+
+def _segs_rtf(segs: list, bullets: bool) -> tuple[bytes, bool]:
+    """runs (props dict, text) -> RTF text with \\b \\i \\ul \\fN \\cfN \\highlightN, as after \\plain."""
+    out, lossy = bytearray(), False
+    cur = (False, False, False, 0, 0, 1)            # b i u font fg bg (palette indices), as after \plain
+    for k, (pr, text) in enumerate(segs):
+        if bullets and k == 0 and pr == {} and text[:1] in _BULLET_RTF:
+            out += _BULLET_RTF[text[0]].encode() + text[1:].encode("ascii")
+            continue
+        fg = nearest_palette(pr["color"]) if pr.get("color") else 0
+        hl = pr.get("hl") or pr.get("shd")
+        bg = nearest_palette(hl) if hl else 1
+        want = (bool(pr.get("b")), bool(pr.get("i")), bool(pr.get("u")), _font_idx(pr.get("font")), fg, bg)
+        if want != cur:
+            cw = b""
+            if want[0] != cur[0]:
+                cw += b"\\b" if want[0] else b"\\b0"
+            if want[1] != cur[1]:
+                cw += b"\\i" if want[1] else b"\\i0"
+            if want[2] != cur[2]:
+                cw += b"\\ul" if want[2] else b"\\ulnone"
+            if want[3] != cur[3]:
+                cw += b"\\f%d" % want[3]
+            if want[4] != cur[4]:
+                cw += b"\\cf%d" % (want[4] + 1)
+            if want[5] != cur[5]:
+                cw += b"\\highlight%d" % (0 if want[5] == 1 else want[5] + 1)
+            out += cw + b" "
+            cur = want
+        s = text.translate(_FOLD)
+        for ch in s:
+            if ch == "\t":
+                out += b"\\tab "
+                continue
+            if ord(ch) < 32:
+                continue
+            try:
+                c = ch.encode(WP_CHARSET)[0]
+            except UnicodeEncodeError:
+                c, lossy = 0x3F, True
+            if c in (0x5C, 0x7B, 0x7D):
+                out += b"\\" + bytes([c])
+            elif c >= 128:
+                out += b"\\'%02x" % c
+            else:
+                out.append(c)
+    return bytes(out), lossy
 
 
 def docx_to_rtf(data: bytes) -> tuple[bytes, bool]:
@@ -873,53 +1030,30 @@ def docx_to_rtf(data: bytes) -> tuple[bytes, bool]:
     lossy |= rd.lossy
     out = bytearray(_HEADER_WP.encode("ascii"))
     for p in paras:
+        if p.cells is not None:
+            n = len(p.cells)
+            cw = 63 // n                                # the WP's cell: cw - 1 characters + a border
+            out += b"\\trowd\\trgaph72\\trleft0" + (b"\\trhdr" if p.header else b"")
+            for k in range(n):
+                out += b"\\clbrdrt\\brdrs\\brdrw10\\clbrdrl\\brdrs\\brdrw10\\clbrdrb\\brdrs\\brdrw10" \
+                       b"\\clbrdrr\\brdrs\\brdrw10\\cellx%d" % ((k + 1) * cw * 144)
+            out += b"\r\n"
+            for segs in p.cells:
+                if sum(len(t) for _, t in segs) > cw - 1:
+                    lossy = True
+                t, ls = _segs_rtf(segs, False)
+                out += b"\\pard\\plain\\intbl\\sb0\\sa0\\sl-240\\slmult0\\ql\\fs24 " + t + b"\\cell\r\n"
+                lossy |= ls
+            out += b"\\row\r\n"
+            continue
         out += b"\\pard\\plain" + {"center": b"\\qc", "right": b"\\qr"}.get(p.align, b"\\ql")
         out += b"\\li%d" % (p.level * LIST_INDENT)
         if p.pagebb:
             out += b"\\pagebb"
         out += b"\\fs24 "
-        cur = (False, False, False, 0, 0, 1)        # b i u font fg bg (palette indices), as after \plain
-        for k, (pr, text) in enumerate(p.segs):
-            if k == 0 and pr == {} and text[:1] in _BULLET_RTF:
-                out += _BULLET_RTF[text[0]].encode() + text[1:].encode("ascii")
-                continue
-            fg = nearest_palette(pr["color"]) if pr.get("color") else 0
-            hl = pr.get("hl") or pr.get("shd")
-            bg = nearest_palette(hl) if hl else 1
-            want = (bool(pr.get("b")), bool(pr.get("i")), bool(pr.get("u")), _font_idx(pr.get("font")), fg, bg)
-            if want != cur:
-                cw = b""
-                if want[0] != cur[0]:
-                    cw += b"\\b" if want[0] else b"\\b0"
-                if want[1] != cur[1]:
-                    cw += b"\\i" if want[1] else b"\\i0"
-                if want[2] != cur[2]:
-                    cw += b"\\ul" if want[2] else b"\\ulnone"
-                if want[3] != cur[3]:
-                    cw += b"\\f%d" % want[3]
-                if want[4] != cur[4]:
-                    cw += b"\\cf%d" % (want[4] + 1)
-                if want[5] != cur[5]:
-                    cw += b"\\highlight%d" % (0 if want[5] == 1 else want[5] + 1)
-                out += cw + b" "
-                cur = want
-            s = text.translate(_FOLD)
-            for ch in s:
-                if ch == "\t":
-                    out += b"\\tab "
-                    continue
-                if ord(ch) < 32:
-                    continue
-                try:
-                    c = ch.encode(WP_CHARSET)[0]
-                except UnicodeEncodeError:
-                    c, lossy = 0x3F, True
-                if c in (0x5C, 0x7B, 0x7D):
-                    out += b"\\" + bytes([c])
-                elif c >= 128:
-                    out += b"\\'%02x" % c
-                else:
-                    out.append(c)
+        t, ls = _segs_rtf(p.segs, True)
+        out += t
+        lossy |= ls
         out += b"\\par\r\n"
     out += b"}\r\n"
     return bytes(out), lossy
