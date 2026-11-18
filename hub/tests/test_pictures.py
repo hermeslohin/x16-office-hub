@@ -14,7 +14,7 @@ from test_officeconv import W, make_docx, r, wp_rtf, zipped
 from x16hub.link import bmx as B
 from x16hub.link import docxconv as D
 from x16hub.link import rtfpict as P
-from x16hub.link.docs import FL_UNSUPPORTED, T_BMX
+from x16hub.link.docs import FL_LOSSY, FL_UNSUPPORTED, T_BMX, T_PIC
 from x16hub.link.client import LinkError
 from x16hub.link import frame as F
 from x16hub.link.ooxml import ConvError
@@ -420,5 +420,76 @@ def test_docs_bmx_type():
                 assert ex.value.code == F.E_BAD_NAME
             await c.save("copy.bmx", pic, conv=3)
             assert h.oc.files["Documents/copy.bmx"][0] == pic
+            await c.close()
+    run(t())
+
+
+def jpeg_with_orientation(img, orientation):
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", exif=exif.tobytes())
+    return buf.getvalue()
+
+
+def test_picture_to_bmx_orient():
+    wide = Image.new("RGB", (40, 20), (255, 0, 0))
+    jpg = jpeg_with_orientation(wide, 6)                            # "rotate 90 degrees to show"
+    assert B.parse_header(B.picture_to_bmx(jpg))["w"] == 40         # Word pictures: as they are
+    hd = B.parse_header(B.picture_to_bmx(jpg, True))
+    assert (hd["w"], hd["h"]) == (20, 40)
+
+
+def test_docs_picture_files_open_as_bmx():
+    async def t():
+        async with Hub() as h:
+            png = png_bytes(noisy(64, 48))
+            big = png_bytes(noisy(1000, 800, 3))                     # over 1 MiB, under the picture limit
+            assert len(big) > 1 << 20
+            h.oc.add("Documents/a.png", png)
+            h.oc.add("Documents/Photos/b.JPG", png_bytes(noisy(1200, 900, 2), "JPEG"))
+            h.oc.add("Documents/c.gif", png_bytes(Image.new("P", (9, 9)), "GIF"))
+            h.oc.add("Documents/big.png", big)
+            h.oc.add("Documents/junk.jpeg", b"not a picture")
+            pic = B.image_to_bmx(noisy(16, 16))
+            h.oc.add("Documents/cat.bmx", pic)
+            h.oc.add("Documents/a.rtf", b"{\\rtf1}")
+            c = await h.client()
+            total, es = await c.list(page=50)
+            by = {x.name: x for x in es}
+            for n in ("a.png", "Photos/b.JPG", "c.gif", "big.png", "junk.jpeg"):
+                assert by[n].type == T_PIC == 8 and not by[n].flags & FL_UNSUPPORTED, n
+            # conv 4: a BMX X16 Write can insert, scaled down to fit 320 x 240
+            info, data = await c.get("a.png", conv=4)
+            hd = B.parse_header(data)
+            assert info["type"] == 8 and info["flags"] & FL_LOSSY and (hd["w"], hd["h"], hd["bpp"]) == (64, 48, 8)
+            hd = B.parse_header((await c.get("Photos/b.JPG", conv=4))[1])
+            assert (hd["w"], hd["h"]) == (320, 240)
+            assert B.parse_header((await c.get("c.gif", conv=4))[1])["w"] == 9
+            hd = B.parse_header((await c.get("big.png", conv=4))[1])
+            assert (hd["w"], hd["h"]) == (300, 240)
+            # a .bmx with conv 4 is sent as it is
+            info, data = await c.get("cat.bmx", conv=4)
+            assert data == pic and info["type"] == 7
+            # raw copies still work (1 MiB limit), other convs are refused
+            assert (await c.get("a.png", conv=3))[1] == png
+            with pytest.raises(LinkError) as ex:
+                await c.open("big.png", 3)
+            assert ex.value.code == F.E_TOO_LARGE
+            for conv in (0, 1, 2):
+                with pytest.raises(LinkError) as ex:
+                    await c.open("a.png", conv)
+                assert ex.value.code == F.E_UNSUPPORTED
+            with pytest.raises(LinkError) as ex:
+                await c.open("a.rtf", 4)
+            assert ex.value.code == F.E_UNSUPPORTED
+            with pytest.raises(LinkError) as ex:
+                await c.open("junk.jpeg", 4)
+            assert ex.value.code == F.E_UNSUPPORTED
+            with pytest.raises(LinkError) as ex:
+                await c.save("new.png", png, conv=4)
+            assert ex.value.code == F.E_BAD_ARG
+            await c.save("copy.png", png, conv=3)
+            assert h.oc.files["Documents/copy.png"][0] == png
             await c.close()
     run(t())

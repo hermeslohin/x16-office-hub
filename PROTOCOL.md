@@ -222,8 +222,10 @@ characters with no ISO-8859-15 form become `?`), `3` = Word (`.docx`),
 `4` = Excel (`.xlsx`), `5` = CSV (`.csv`, UTF-8 on ownCloud), `0` = other
 (listed; only `conv 3` can open or save it), `6` = folder (DIR entries only),
 `7` = BMX picture (`.bmx`, the X16 bitmap format X16 Write inserts; not flagged unsupported,
-transferred with `conv 3` only: conv 0/1/2 are refused like for type 0, and a conv 0/1/2 SAVE
-name may not end in `.bmx`).
+transferred with `conv 3`, or opened with `conv 4` as it is: conv 0/1/2 are refused like for type 0,
+and a conv 0/1/2 SAVE name may not end in `.bmx`), `8` = picture (`.png` `.jpg` `.jpeg` `.gif`
+`.bmp`: opened with `conv 4` as a BMX, or moved raw with `conv 3`; conv 0/1/2 are refused, and a
+conv 0/1/2 SAVE name may not end in one of those).
 
 **conv** (OPEN and SAVE) says what the X16 side holds:
 
@@ -233,8 +235,9 @@ name may not end in `.bmx`).
 | 1 | RTF for the X16 WP | `.rtf` `.txt` `.docx` |
 | 2 | X16 sheet = "simple XLSX" (commanderx16sheets `SHEETFMT.md`) | `.xlsx` `.csv` |
 | 3 | raw bytes, byte-for-byte both ways, no charset conversion (X16 file manager) | any file, any extension |
+| 4 | a BMX picture for X16 Write (OPEN only) | `.bmx` (as it is), `.png` `.jpg` `.jpeg` `.gif` `.bmp` (converted) |
 
-conv > 3 is `ERR BAD_ARG`; a conv that doesn't fit the file type is
+conv > 4, and conv 4 on SAVE, is `ERR BAD_ARG`; a conv that doesn't fit the file type is
 `ERR UNSUPPORTED` (checked at `OPEN` / `SAVE`, before any data moves).
 Conversions (hub module in brackets):
 
@@ -255,6 +258,12 @@ Conversions (hub module in brackets):
   320 × 240, ≤ 256 colours of the 12-bit palette, transparent → white) at their place, a picture
   inside a paragraph splitting it; EMF/WMF, pictures in tables and everything past 160,000 BMX
   bytes per document are dropped (LOSSY). [`bmx`, needs Pillow]
+* pictures conv 4 [`bmx`]: OPEN → BMX v1 8 bpp, same rules as pictures in `.docx` (scaled down
+  to fit 320 × 240, ≤ 256 colours of the 12-bit palette, transparent → white), turned upright by
+  the EXIF orientation; always LOSSY. The source may be up to 16 MiB (phone photos; the 1 MiB limit
+  is for what goes over the link), so LIST flags a picture unsupported only above 16 MiB (bit2
+  still says it is over 1 MiB, i.e. too big for `conv 3`). A file that isn't a readable picture is
+  `ERR UNSUPPORTED` ("cannot convert: ...").
 * `.rtf` conv 1 [`rtfpict`]: SAVE adds, after each `{\*\xwpbmx}` group, a paragraph Word shows:
   `\pard\plain\qc{\*\xwppng}{\pict\pngblip\picwW\pichH\picwgoalTW\pichgoalTH HEX}\par`
   (X16 Write's reader skips it). OPEN removes those `{\*\xwppng}` paragraphs again (an X16 RTF
@@ -280,7 +289,7 @@ rep : total u16, start u16, n u8, n × entry
 entry: type u8, flags u8, size u32, mtime u32 (unix UTC),
        year-2000 u8, month u8, day u8, hour u8, min u8   (local, America/New_York),
        name str
-flags: bit0 unsupported (type 0, name too long or not encodable; never for type 7 `.bmx` alone),
+flags: bit0 unsupported (type 0, name too long or not encodable; never for types 7 / 8 alone),
        bit1 name shown lossy (non ISO-8859-15 chars replaced with '?'),
        bit2 file larger than the 1 MiB limit
 ```

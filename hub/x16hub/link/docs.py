@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from . import frame as F
 from .frame import Reader, pstr
-from . import docxconv, rtfpict, sheetconv
+from . import bmx, docxconv, rtfpict, sheetconv
 from .ooxml import ConvError
 from .rtfconv import WP_CHARSET, decode_utf8, rtf_to_text, text_to_rtf, to_wire_text
 
@@ -32,11 +32,17 @@ _BAD_CHARS = set('\\:*?"<>|')
 
 T_OTHER, T_RTF, T_TXT, T_DOCX, T_XLSX, T_CSV = 0, 1, 2, 3, 4, 5
 T_DIR = 6                       # DIR entries only: a folder
-T_BMX = 7                       # an X16 bitmap picture (X16 Write inserts it); raw transfers (conv 3) only
-_EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": T_CSV, ".bmx": T_BMX}
+T_BMX = 7                       # an X16 bitmap picture (X16 Write inserts it); conv 3 (raw) or 4
+T_PIC = 8                       # a PNG / JPEG / GIF / BMP picture: opened with conv 4 (as BMX) or raw
+_EXT = {".rtf": T_RTF, ".txt": T_TXT, ".docx": T_DOCX, ".xlsx": T_XLSX, ".csv": T_CSV, ".bmx": T_BMX,
+        ".png": T_PIC, ".jpg": T_PIC, ".jpeg": T_PIC, ".gif": T_PIC, ".bmp": T_PIC}
 # conv 0 = native bytes, 1 = RTF on the X16 side, 2 = X16 sheet (simple XLSX) on the X16 side,
-# 3 = raw: byte-for-byte, any file type (file manager copies)
+# 3 = raw: byte-for-byte, any file type (file manager copies), 4 = BMX picture on the X16 side
+# (OPEN only: a .bmx as it is, a picture converted by bmx.picture_to_bmx)
 CONV_RAW = 3
+CONV_BMX = 4
+MAX_PIC_SRC = 16 << 20          # a picture opened with conv 4 may be this big on ownCloud (phone photos);
+                                # what the X16 gets is a BMX of at most 320 x 240 (~77 KB)
 CONV_OK = {T_RTF: (0, 1), T_TXT: (0, 1), T_DOCX: (0, 1), T_XLSX: (0, 2), T_CSV: (0, 2)}
 FL_UNSUPPORTED, FL_LOSSY, FL_TOO_LARGE = 1, 2, 4
 
@@ -63,9 +69,13 @@ def file_type(name: str) -> int:
 
 
 def check_conv(t: int, conv: int) -> None:
-    if conv not in (0, 1, 2, CONV_RAW):
+    if conv not in (0, 1, 2, CONV_RAW, CONV_BMX):
         raise DocError(F.E_BAD_ARG, "bad conv")
     if conv == CONV_RAW:
+        return
+    if conv == CONV_BMX:
+        if t not in (T_BMX, T_PIC):
+            raise DocError(F.E_UNSUPPORTED, "conversion not available for this file type")
         return
     if t not in CONV_OK:
         raise DocError(F.E_UNSUPPORTED, "file type not supported")
@@ -138,7 +148,8 @@ class Entry:
             bad = False
         except DocError:
             bad = True
-        if (t == T_OTHER and not self.raw_ok) or bad or lossy or len(wn) > MAX_NAME or self.size > MAX_FILE:
+        limit = MAX_PIC_SRC if t == T_PIC else MAX_FILE         # a picture is converted before it is sent
+        if (t == T_OTHER and not self.raw_ok) or bad or lossy or len(wn) > MAX_NAME or self.size > limit:
             flags |= FL_UNSUPPORTED
         return (bytes([t, flags]) + struct.pack("<II", min(self.size, 0xFFFFFFFF), self.mtime & 0xFFFFFFFF)
                 + _local5(self.mtime) + pstr(wn[:255]))
@@ -366,14 +377,21 @@ class DocsChannel:
         st = await self._call(self.oc.stat, path)
         if st is None or st["is_dir"]:
             raise DocError(F.E_NOT_FOUND, "file not found")
-        if st["size"] > MAX_FILE:
-            raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
-        data, etag = await self._call(self.oc.get, path, max_bytes=MAX_FILE)
-        if len(data) > MAX_FILE:
-            raise DocError(F.E_TOO_LARGE, "file is larger than 1 MiB")
+        limit, what = (MAX_PIC_SRC, "16 MiB") if t == T_PIC and conv == CONV_BMX else (MAX_FILE, "1 MiB")
+        if st["size"] > limit:
+            raise DocError(F.E_TOO_LARGE, f"file is larger than {what}")
+        data, etag = await self._call(self.oc.get, path, max_bytes=limit)
+        if len(data) > limit:
+            raise DocError(F.E_TOO_LARGE, f"file is larger than {what}")
         lossy = False
-        if conv == CONV_RAW:
+        if conv == CONV_RAW or (conv == CONV_BMX and t == T_BMX):
             pass
+        elif conv == CONV_BMX:                          # PNG / JPEG / GIF / BMP -> BMX for X16 Write
+            try:
+                data = await _convert(bmx.picture_to_bmx, data, True)
+            except ConvError as e:
+                raise DocError(F.E_UNSUPPORTED, f"cannot convert: {e}"[:120]) from None
+            lossy = True                                # scaled to fit 320 x 240, 12-bit colour
         elif t in (T_TXT, T_CSV) and conv == 0:
             data, lossy = to_wire_text(decode_utf8(data))
         elif t == T_TXT:

@@ -11,7 +11,9 @@ for the indices [start, start + entries) (any other index is black), then `heigh
 * bmx_to_image(data) -> RGB image; bmx_to_png(data) -> (PNG bytes, width, height)
 * image_to_bmx(img) -> BMX v1 8 bpp (VERA depth 3), at most 320 x 240 (scaled down, never up),
   up to 256 colours from the 12-bit VERA colour space, transparent pixels white.
-* picture_to_bmx(data) -> BMX from untrusted PNG / JPEG / GIF / BMP bytes (pixel-capped).
+* picture_to_bmx(data, orient=False) -> BMX from untrusted PNG / JPEG / GIF / BMP bytes (pixel-capped);
+  orient: turn it the way its EXIF orientation says (loose photos opened with conv 4; pictures inside
+  Word documents are left as Word shows them).
 * display_size(w, h): the size rule shared with X16 Write (f = min(1, 496/w, 640/h) in X16 page
   pixels, 80 of them per inch) -> EMU / twips helpers.
 * rtf_group(bmx): the {\\*\\xwpbmx HEX} group X16 Write's RTF carries a picture in.
@@ -23,7 +25,7 @@ from __future__ import annotations
 import io
 import struct
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .ooxml import ConvError
 
@@ -164,7 +166,7 @@ def image_to_bmx(img: Image.Image) -> bytes:
     return head + bytes(pal) + pix
 
 
-def picture_to_bmx(data: bytes) -> bytes:
+def picture_to_bmx(data: bytes, orient: bool = False) -> bytes:
     """untrusted PNG / JPEG / GIF / BMP bytes -> BMX (ConvError if unreadable or too big)"""
     try:
         img = Image.open(io.BytesIO(data), formats=SRC_FORMATS)
@@ -173,6 +175,8 @@ def picture_to_bmx(data: bytes) -> bytes:
         if img.width * img.height > MAX_SRC_PIXELS or img.width <= 0 or img.height <= 0:
             raise ConvError("picture is too large")
         img.load()
+        if orient:
+            img = ImageOps.exif_transpose(img)
         return image_to_bmx(img)
     except ConvError:
         raise

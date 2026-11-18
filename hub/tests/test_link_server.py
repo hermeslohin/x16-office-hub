@@ -531,7 +531,10 @@ def test_open_office_conversions():
                     await c.open(name, 2)
                 assert e.value.code == F.E_UNSUPPORTED
             with pytest.raises(LinkError) as e:
-                await c.open("a.docx", 4)
+                await c.open("a.docx", 4)                   # conv 4 (BMX) is for pictures only
+            assert e.value.code == F.E_UNSUPPORTED
+            with pytest.raises(LinkError) as e:
+                await c.open("a.docx", 5)
             assert e.value.code == F.E_BAD_ARG
             with pytest.raises(LinkError) as e:
                 await c.open("bad.xlsx", 2)
