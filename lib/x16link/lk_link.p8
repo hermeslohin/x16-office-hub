@@ -380,7 +380,9 @@ _yes        lda  #1
             if not modem_ok()
                 return seterr(S_NOMODEM, iso:"modem not answering")
         }
-        lku.puts(iso:"ATE0\r")
+        ; E0 = no echo; F0 = force RTS/CTS flow control: under XON/XOFF (or none) Zimodem eats
+        ; $11/$13 or the UART overruns, so replies holding those bytes never arrive intact
+        lku.puts(iso:"ATE0F0\r")
         void lku.expect(iso:"OK", 0, 120)
         lku.drain(6)
         lku.puts(iso:"ATD\"")

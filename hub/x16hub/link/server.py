@@ -399,7 +399,11 @@ class Session:
             await self.send_err(fr2.seq, F.E_AUTH_FAIL, "authentication failed")
             return
         self.authed, self.device = True, dev
-        await self.send(F.CH_CTRL, fr2.seq, F.OP_AUTH | F.REPLY, K.server_tag(key, t))
+        reply = await self.send(F.CH_CTRL, fr2.seq, F.OP_AUTH | F.REPLY, K.server_tag(key, t))
+        # A lossy serial link can garble this reply; the X16 then resends the identical AUTH frame
+        # (same seq). Let serve() replay the same bytes instead of answering "already authenticated".
+        self.last_req = (fr2.chan, fr2.seq, fr2.op, fr2.payload)
+        self.last_reply = reply
         log.info("device %s authenticated from %s", dev, self.ip)
 
     async def serve(self) -> None:
