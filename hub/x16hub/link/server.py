@@ -374,13 +374,25 @@ class Session:
         self.peer_maxrx = min(maxrx, F.ABS_MAX_PAYLOAD)
         self.hello_ok = True
         snonce = secrets.token_bytes(16)
-        await self.send(F.CH_CTRL, fr.seq, F.OP_HELLO | F.REPLY,
-                        bytes([F.VERSION]) + struct.pack("<H", self.L.hub_maxrx) + snonce + pstr(self.server.hubname))
-        try:
-            fr2 = await self.read_frame(F.PREAUTH_MAX_PAYLOAD, self.L.handshake)
-        except FrameError as e:
-            await self.send_err(0xFF, e.code, str(e))
-            return
+        hello_reply = await self.send(F.CH_CTRL, fr.seq, F.OP_HELLO | F.REPLY,
+                                      bytes([F.VERSION]) + struct.pack("<H", self.L.hub_maxrx) + snonce
+                                      + pstr(self.server.hubname))
+        # A lossy serial link can garble the HELLO reply; the X16 then resends the identical HELLO
+        # (same seq). Replay the same bytes (same snonce) a couple of times instead of counting it as a
+        # failed AUTH; anything else still goes through the normal AUTH check below.
+        for _ in range(3):
+            try:
+                fr2 = await self.read_frame(F.PREAUTH_MAX_PAYLOAD, self.L.handshake)
+            except FrameError as e:
+                await self.send_err(0xFF, e.code, str(e))
+                return
+            if (fr2.chan, fr2.seq, fr2.op, fr2.payload) != (fr.chan, fr.seq, fr.op, fr.payload):
+                break
+            self.w.write(hello_reply)
+            try:
+                await asyncio.wait_for(self.w.drain(), self.L.write)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                raise Hangup() from None
         try:
             keys = self.server.keys_loader()
         except Exception as e:  # noqa: BLE001

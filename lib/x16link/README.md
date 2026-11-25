@@ -34,7 +34,7 @@ or in another bank, not in the transport.
 
 * Leave golden RAM **$0400-$07FF** alone. It holds `XB` (the payload buffer,
   $0400-$0607), the SHA/HMAC scratch (inside XB, $0500-$05FF, used only while connecting)
-  and the UART receive ring ($0700-$07FF). Callers may use $0608-$06FF (X16 Write's
+  and the UART receive ring ($0700-$07FF). Callers may use $0608-$06FB ($06FC-$06FF holds the UART read stub; X16 Write's
   cloud bank uses $0608-$06F3).
 * Don't use RAM banks 60/61. X16 Write also uses bank 62 for `X16WPCL.BIN`.
 * Strings and buffers passed to the libraries must be in main RAM or golden RAM, never

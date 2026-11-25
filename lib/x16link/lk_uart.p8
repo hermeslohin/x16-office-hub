@@ -11,6 +11,10 @@ lku {
     &ubyte MCR = $9fe4
     &ubyte LSR = $9fe5
     &ubyte SCR = $9fe7
+    ; Read RBR only from code in main/golden RAM: on some real X16s an "lda $9fe0" executed from
+    ; banked RAM ($A000-$BFFF) reads a received $FF as $00 (seen on hardware, not in x16emu). init()
+    ; puts "lda $9fe0 / rts" here ($06FC-$06FF, golden RAM no app uses); poll and rx_direct jsr it.
+    const uword RBRSTUB = $06fc
 
     const ubyte DIV_115200 = 8      ; 921600 / 115200 (14.7456 MHz crystal)
 
@@ -20,6 +24,17 @@ lku {
 
     ; returns false if no UART answers at $9FE0 (scratch register test)
     sub init() -> bool {
+        %asm {{
+            ldx  #3
+-           lda  _stub,x
+            sta  p8c_RBRSTUB,x
+            dex
+            bpl  -
+            bra  +
+_stub       lda  $9fe0
+            rts
++
+        }}
         SCR = $a5
         if SCR != $a5
             return false
@@ -49,7 +64,7 @@ _more       lda  $9fe5
             cpx  p8v_rtail
             beq  _done              ; ring full: leave it in the FIFO (RTS/CTS will throttle)
             dex
-            lda  $9fe0
+            jsr  p8c_RBRSTUB            ; lda $9fe0 from main RAM, see init()
             sta  $0700,x
             inc  p8v_rhead
             bra  _more
@@ -67,6 +82,54 @@ _done       rts
         ubyte b = @(ring + rtail)
         rtail++
         return b
+    }
+
+    ; Receive cnt (>= 1) bytes into dst: first whatever poll() already put in the ring, then straight
+    ; from the UART with IRQs off, ~40 cycles a byte (a byte takes 87 us at 115200), so the 16-byte
+    ; FIFO can't overrun wherever this code runs (the old Prog8 getb loop could not keep up on real
+    ; X16s when running from banked RAM). Gives up after ~0.8 s without a byte; returns how many
+    ; bytes are still missing.
+    asmsub rx_direct(uword dst @R0, uword cnt @R1) clobbers(X) -> uword @AY {
+        %asm {{
+            php
+            sei
+_byte       ldx  p8v_rtail
+            cpx  p8v_rhead
+            beq  _uart
+            lda  $0700,x
+            inc  p8v_rtail
+            bra  _got
+_uart       ldx  #0
+            stz  cx16.r2L
+            lda  #8
+            sta  cx16.r2H
+_poll       lda  $9fe5
+            lsr  a
+            bcs  _rbr
+            dex
+            bne  _poll
+            dec  cx16.r2L
+            bne  _poll
+            dec  cx16.r2H
+            bne  _poll
+            bra  _done
+_rbr        jsr  p8c_RBRSTUB
+_got        sta  (cx16.r0)
+            inc  cx16.r0
+            bne  +
+            inc  cx16.r0+1
++           lda  cx16.r1
+            bne  +
+            dec  cx16.r1+1
++           dec  cx16.r1
+            lda  cx16.r1
+            ora  cx16.r1+1
+            bne  _byte
+_done       plp
+            lda  cx16.r1
+            ldy  cx16.r1+1
+            rts
+        }}
     }
 
     ; wait up to 'jiffies' for a byte. returns true + byte in getb_val

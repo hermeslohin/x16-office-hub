@@ -2,7 +2,7 @@
 ; X16LINK.BIN in RAM bank 60, X16DOCS.BIN in RAM bank 61. See x16link_api.p8.
 ; Every pointer passed in (names, destination buffers) must be in main RAM or golden RAM, never in
 ; banked RAM: the library runs with its own bank mapped at $A000.
-; Golden RAM map: $0400-$0607 XB payload buffer, $0608-$06FF free for callers (X16 Write's cloud
+; Golden RAM map: $0400-$0607 XB payload buffer, $0608-$06FB free for callers ($06FC-$06FF: the UART read stub) (X16 Write's cloud
 ; library uses $0608-$06F3), $0700-$07FF UART receive ring.
 
 lkapi {

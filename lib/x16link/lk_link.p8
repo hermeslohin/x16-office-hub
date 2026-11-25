@@ -143,14 +143,10 @@ _nc         .byte $4e, $4f, $20, $43, $41, $52, $52, $49, $45, $52     ; ISO "NO
         rlen = mkword(hi, lo)
         if rlen > MAXRX
             return bad_frame(2)
-        uword i = 2
         uword total = rlen + 7
-        while i < total {
-            if not lku.getb(120)
-                return bad_frame(i)
-            @(rxb + i) = lku.getb_val
-            i++
-        }
+        uword left = lku.rx_direct(rxb + 2, total - 2)
+        if left != 0
+            return bad_frame(total - left)
         lkc.crc16_init()
         lkc.crc16_buf(rxb, rlen + 5)
         if @(rxb + 5 + rlen) != lkc.crclo or @(rxb + 6 + rlen) != lkc.crchi
@@ -163,7 +159,7 @@ _nc         .byte $4e, $4f, $20, $43, $41, $52, $52, $49, $45, $52     ; ISO "NO
     ; and the message goes to errmsg. Retransmits keep the same SEQ: the hub replays, never re-runs.
     sub request(ubyte chan, ubyte op, uword plen, uword timeout) -> ubyte {
         if not online
-            return seterr(S_OFFLINE, iso:"not connected")
+            return seterr(S_OFFLINE, iso:"offline")
         if plen > MAXRX
             return seterr(S_BADARG, iso:"too long")
         seq++
@@ -180,7 +176,7 @@ resend:
 again:
         if junk >= 8 {
             drop()
-            return seterr(S_PROTO, iso:"hub sends unexpected frames")
+            return seterr(S_PROTO, iso:"hub sends junk")
         }
         r = recv_frame(timeout)
         if r == R_OK {
@@ -282,7 +278,7 @@ _yes        lda  #1
     sub load_key(uword name) -> ubyte {
         have_key = false
         if not lkut.f_ropen(name)
-            return seterr(S_NOKEY, iso:"no X16LINK.KEY on SD card")
+            return seterr(S_NOKEY, iso:"no X16LINK.KEY")
         uword n = lkut.f_read(rxb, 400)
         lkut.f_rclose()
         @(rxb + n) = 0
@@ -369,16 +365,16 @@ _yes        lda  #1
         ubyte st
         ubyte i
         if not have_key
-            return seterr(S_NOKEY, iso:"no key loaded")
+            return seterr(S_NOKEY, iso:"no key")
         if not lku.init()
-            return seterr(S_NOUART, iso:"no serial card at $9FE0")
+            return seterr(S_NOUART, iso:"no serial card")
         online = false
         sys.wait(6)
         lku.drain(6)
         if not modem_ok() {
             lku.hangup_modem()          ; maybe still in a data call from earlier
             if not modem_ok()
-                return seterr(S_NOMODEM, iso:"modem not answering")
+                return seterr(S_NOMODEM, iso:"no modem")
         }
         ; E0 = no echo; F0 = force RTS/CTS flow control: under XON/XOFF (or none) Zimodem eats
         ; $11/$13 or the UART overruns, so replies holding those bytes never arrive intact
@@ -419,7 +415,7 @@ _yes        lda  #1
         lkut.g_begin(rlen)
         if lkut.g8() != VERSION {
             drop()
-            return seterr(S_PROTO, iso:"wrong hub version")
+            return seterr(S_PROTO, iso:"bad hub version")
         }
         void lkut.g16()
         lkut.gmem(&snonce, 16)

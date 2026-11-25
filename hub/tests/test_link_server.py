@@ -121,6 +121,44 @@ def test_replayed_auth_is_useless():
     run(t())
 
 
+def test_retransmitted_hello_is_replayed_not_refused():
+    """Lossy serial link: the X16 resends the identical HELLO; the hub replays the same reply
+    (same snonce) and the AUTH that follows still works. Endless resends still end in a refusal."""
+    async def t():
+        async with Hub() as h:
+            r, w = await h.raw()
+
+            async def rd():
+                hdr = await asyncio.wait_for(r.readexactly(2), 3)
+                return hdr + await asyncio.wait_for(r.readexactly(3 + struct.unpack("<H", hdr)[0] + 2), 3)
+
+            cn = os.urandom(16)
+            hello = F.encode(0, 1, F.OP_HELLO, F.MAGIC + b"\x01" + struct.pack("<H", 512) + F.pstr(DEV) + cn)
+            w.write(hello)
+            await w.drain()
+            first = await rd()
+            w.write(hello)                                  # reply "lost", resent
+            await w.drain()
+            assert await rd() == first                      # byte-identical, same snonce
+            sn = F.decode(first)[0].payload[3:19]
+            w.write(F.encode(0, 2, F.OP_AUTH, K.client_tag(KEY, K.transcript(DEV.encode(), cn, sn))))
+            await w.drain()
+            assert F.decode(await rd())[0].op == F.OP_AUTH | F.REPLY
+            w.close()
+
+            r, w = await h.raw()
+            w.write(hello * 5)                              # a peer that only ever resends HELLO
+            await w.drain()
+            data = b""
+            while True:
+                b = await asyncio.wait_for(r.read(4096), 3)
+                if not b:
+                    break
+                data += b
+            assert data.count(first[:5]) <= 4 and b"authentication failed" in data
+    run(t())
+
+
 def test_retransmitted_auth_is_replayed_not_refused():
     """Lossy serial link: the X16 resends the identical AUTH frame; the hub must replay its reply."""
     async def t():
